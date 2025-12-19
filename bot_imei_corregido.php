@@ -2,28 +2,34 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  * BOT TELEGRAM - GENERADOR DE IMEI CON SISTEMA DE CRÉDITOS
+ * Y SISTEMA DE PAGOS COMPLETO
  * ═══════════════════════════════════════════════════════════════
  * 
  * CARACTERÍSTICAS:
  * ✓ Sistema de usuarios con créditos
  * ✓ Generación de IMEIs (cuesta 1 crédito)
  * ✓ Registro automático con créditos gratis
- * ✓ Sistema de pagos/recargas
+ * ✓ Sistema de pagos completo con capturas
+ * ✓ Múltiples métodos de pago
  * ✓ Comandos de administración
  * ✓ Historial de uso
  * ✓ Sistema de usuarios premium
  * ✓ Bloqueo de usuarios
+ * ✓ Sistema de cupones
+ * ✓ Notificaciones automáticas
  * 
  * ═══════════════════════════════════════════════════════════════
  */
 
 // ============================================
-// CONFIGURACIÓN - Usando config_bot.php
+// CONFIGURACIÓN
 // ============================================
 
 require_once(__DIR__ . '/config_bot.php');
 require_once(__DIR__ . '/config_imeidb.php');
 require_once(__DIR__ . '/imeidb_api.php');
+require_once(__DIR__ . '/sistema_pagos.php');
+require_once(__DIR__ . '/comandos_pagos.php');
 
 define('API_URL', 'https://api.telegram.org/bot' . BOT_TOKEN . '/');
 
@@ -226,31 +232,11 @@ class Database {
     // PAGOS Y RECARGAS
     // ═══════════════════════════════════════
     
-    public function crearPagoPendiente($telegramId, $paquete, $creditos, $monto, $moneda, $metodoPago) {
-        $sql = "INSERT INTO pagos_pendientes (telegram_id, paquete, creditos, monto, moneda, metodo_pago)
-                VALUES (:telegram_id, :paquete, :creditos, :monto, :moneda, :metodo_pago)";
-        
-        try {
-            $stmt = $this->conn->prepare($sql);
-            $stmt->execute([
-                ':telegram_id' => $telegramId,
-                ':paquete' => $paquete,
-                ':creditos' => $creditos,
-                ':monto' => $monto,
-                ':moneda' => $moneda,
-                ':metodo_pago' => $metodoPago
-            ]);
-            return $this->conn->lastInsertId();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
     public function getPagosPendientes($limite = 20) {
         $sql = "SELECT p.*, u.username, u.first_name 
                 FROM pagos_pendientes p
                 LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-                WHERE p.estado = 'pendiente'
+                WHERE p.estado IN ('pendiente', 'captura_enviada', 'esperando_captura')
                 ORDER BY p.fecha_solicitud DESC
                 LIMIT :limite";
         
@@ -261,55 +247,6 @@ class Database {
             return $stmt->fetchAll(PDO::FETCH_ASSOC);
         } catch(PDOException $e) {
             return [];
-        }
-    }
-    
-    public function aprobarPago($pagoId, $adminId) {
-        // Obtener datos del pago
-        $sql = "SELECT * FROM pagos_pendientes WHERE id = :id AND estado = 'pendiente'";
-        $stmt = $this->conn->prepare($sql);
-        $stmt->execute([':id' => $pagoId]);
-        $pago = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if (!$pago) return false;
-        
-        try {
-            $this->conn->beginTransaction();
-            
-            // Actualizar estado del pago
-            $sql = "UPDATE pagos_pendientes SET estado = 'aprobado' WHERE id = :id";
-            $stmt = $this->conn->prepare($sql);
-            $stmt->execute([':id' => $pagoId]);
-            
-            // Agregar créditos al usuario
-            $this->actualizarCreditos($pago['telegram_id'], $pago['creditos'], 'add');
-            
-            // Registrar transacción
-            $this->registrarTransaccion(
-                $pago['telegram_id'],
-                'compra',
-                $pago['creditos'],
-                "Compra de {$pago['paquete']} - {$pago['monto']} {$pago['moneda']}",
-                $adminId
-            );
-            
-            $this->conn->commit();
-            return true;
-        } catch(PDOException $e) {
-            $this->conn->rollBack();
-            return false;
-        }
-    }
-    
-    public function rechazarPago($pagoId) {
-        $sql = "UPDATE pagos_pendientes SET estado = 'rechazado' WHERE id = :id";
-        
-        try {
-            $stmt = $this->conn->prepare($sql);
-            $stmt->execute([':id' => $pagoId]);
-            return $stmt->rowCount() > 0;
-        } catch(PDOException $e) {
-            return false;
         }
     }
     
@@ -391,7 +328,7 @@ class Database {
             $stats['usuarios_hoy'] = $stmt->fetch()['total'];
             
             // Pagos pendientes
-            $stmt = $this->conn->query("SELECT COUNT(*) as total FROM pagos_pendientes WHERE estado = 'pendiente'");
+            $stmt = $this->conn->query("SELECT COUNT(*) as total FROM pagos_pendientes WHERE estado IN ('pendiente', 'captura_enviada')");
             $stats['pagos_pendientes'] = $stmt->fetch()['total'];
             
             // Usuarios premium
@@ -476,10 +413,6 @@ class EstadosUsuario {
 // FUNCIONES IMEI (del bot original)
 // ============================================
 
-/**
- * Valida un IMEI completo usando el algoritmo de Luhn
- * ALINEADO CON TU CÓDIGO JAVASCRIPT
- */
 function validarIMEI($imei) {
     $imei = preg_replace('/[^0-9]/', '', $imei);
     
@@ -496,7 +429,6 @@ function validarIMEI($imei) {
     for ($i = 0; $i < 14; $i++) {
         $digito = intval($imei[$i]);
         
-        // Duplicar en posiciones IMPARES (i % 2 === 1)
         if ($i % 2 === 1) {
             $digito *= 2;
             if ($digito > 9) {
@@ -523,7 +455,6 @@ function calcularDigitoVerificador($imei14) {
     for ($i = 0; $i < 14; $i++) {
         $digito = intval($imei14[$i]);
         
-        // Duplicar en posiciones IMPARES (igual que validarIMEI)
         if ($i % 2 === 1) {
             $digito *= 2;
             if ($digito > 9) {
@@ -634,7 +565,7 @@ function getTecladoPrincipal($esAdmin = false) {
 function getTecladoAdmin() {
     return crearTeclado([
         [['text' => '📊 Estadísticas'], ['text' => '👥 Top Usuarios']],
-        [['text' => '💸 Pagos Pendientes'], ['text' => '➕ Agregar Créditos']],
+        [['text' => '💸 Panel de Pagos'], ['text' => '➕ Agregar Créditos']],
         [['text' => '🚫 Bloquear Usuario'], ['text' => '⭐ Hacer Premium']],
         [['text' => '📱 Gestionar Modelos'], ['text' => '📡 Stats API']],
         [['text' => '🔙 Volver al Menú']]
@@ -844,54 +775,6 @@ function comandoHistorial($chatId, $telegramId, $db) {
     enviarMensaje($chatId, $respuesta);
 }
 
-function comandoComprarCreditos($chatId) {
-    $respuesta = "╔═══════════════════════════╗\n";
-    $respuesta .= "║  💰 COMPRAR CRÉDITOS 💰   ║\n";
-    $respuesta .= "╚═══════════════════════════╝\n\n";
-    
-    $respuesta .= "🎁 *PAQUETES DISPONIBLES*\n";
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-    
-    $respuesta .= "🥉 *BÁSICO*\n";
-    $respuesta .= "├ 💎 50 créditos\n";
-    $respuesta .= "├ 💵 \$5.00 USD\n";
-    $respuesta .= "└ 📱 50 generaciones\n\n";
-    
-    $respuesta .= "🥈 *ESTÁNDAR*\n";
-    $respuesta .= "├ 💎 100 créditos\n";
-    $respuesta .= "├ 💵 \$10.00 USD\n";
-    $respuesta .= "├ 🎁 Ahorra \$2\n";
-    $respuesta .= "└ 📱 100 generaciones\n\n";
-    
-    $respuesta .= "🥇 *PREMIUM*\n";
-    $respuesta .= "├ 💎 200 créditos\n";
-    $respuesta .= "├ 💵 \$18.00 USD\n";
-    $respuesta .= "├ 🎁 Ahorra \$5\n";
-    $respuesta .= "└ 📱 200 generaciones\n\n";
-    
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    $respuesta .= "💳 *MÉTODOS DE PAGO*\n";
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-    
-    $respuesta .= "✅ Yape (Perú)\n";
-    $respuesta .= "✅ PayPal\n";
-    $respuesta .= "✅ Bitcoin/USDT\n\n";
-    
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    $respuesta .= "📞 *CONTACTO*\n";
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-    
-    $respuesta .= "💬 Contacta: @CHAMOGSM\n";
-    $respuesta .= "📧 Indica el paquete\n";
-    $respuesta .= "💸 Realiza el pago\n";
-    $respuesta .= "⚡ Activación inmediata\n\n";
-    
-    $respuesta .= "🎯 Los créditos se acreditan\n";
-    $respuesta .= "tras verificar el pago";
-    
-    enviarMensaje($chatId, $respuesta);
-}
-
 function comandoAyuda($chatId) {
     $respuesta = "╔═══════════════════════════╗\n";
     $respuesta .= "║      ❓ AYUDA ❓          ║\n";
@@ -953,7 +836,6 @@ function comandoAyuda($chatId) {
 // ============================================
 
 function comandoInfo($chatId, $texto, $db) {
-    // Extraer TAC del comando /info
     $partes = explode(' ', trim($texto));
     
     if (count($partes) < 2) {
@@ -963,25 +845,19 @@ function comandoInfo($chatId, $texto, $db) {
     
     $input = preg_replace('/[^0-9]/', '', $partes[1]);
     
-    // Validar que tenga al menos 8 dígitos
     if (strlen($input) < 8) {
         enviarMensaje($chatId, "❌ Debe tener al menos 8 dígitos");
         return;
     }
     
-    // Extraer TAC
     $tac = substr($input, 0, 8);
     
     enviarMensaje($chatId, "🔍 Consultando información...\n⏳ Por favor espera...");
     
-    // Crear instancia de la API con autenticación
     $api = new IMEIDbAPI($db, IMEIDB_API_KEY);
-    
-    // Consultar información
     $info = $api->obtenerInformacionFormateada($input);
     
     if ($info === false) {
-        // Si falla la API, buscar en BD local
         $modeloData = $db->buscarModelo($tac);
         
         if ($modeloData) {
@@ -1004,7 +880,6 @@ function comandoInfo($chatId, $texto, $db) {
 // ============================================
 
 function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
-    // Verificar usuario
     $usuario = $db->getUsuario($telegramId);
     
     if (!$usuario) {
@@ -1024,7 +899,6 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
         return;
     }
     
-    // Extraer TAC
     $tac = extraerTAC($texto);
     if (!$tac) {
         $tac = preg_replace('/[^0-9]/', '', $texto);
@@ -1045,7 +919,6 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
         return;
     }
     
-    // Verificar créditos
     if ($usuario['creditos'] < COSTO_GENERACION && !$usuario['es_premium']) {
         $respuesta = "╔═══════════════════════════╗\n";
         $respuesta .= "║   ⚠️ SIN CRÉDITOS ⚠️      ║\n";
@@ -1061,16 +934,13 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
         return;
     }
     
-    // Buscar modelo en BD primero
     $modeloData = $db->buscarModelo($tac);
     
-    // Si no se encuentra el modelo, intentar consultar la API
     if (!$modeloData) {
         $api = new IMEIDbAPI($db, IMEIDB_API_KEY);
         $datosAPI = $api->consultarIMEI($tac);
         
         if ($datosAPI && isset($datosAPI['modelo'])) {
-            // Si la API devuelve datos, usarlos
             $modeloData = [
                 'tac' => $tac,
                 'modelo' => $datosAPI['modelo'],
@@ -1080,23 +950,18 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
         }
     }
     
-    // Generar IMEIs
     $imeis = generarMultiplesIMEIs($tac, 2);
     
-    // Descontar crédito (si no es premium)
     if (!$usuario['es_premium']) {
         $db->actualizarCreditos($telegramId, COSTO_GENERACION, 'subtract');
         $db->registrarTransaccion($telegramId, 'uso', COSTO_GENERACION, "Generación de IMEIs - TAC: {$tac}");
     }
     
-    // Incrementar contador
     $db->incrementarGeneraciones($telegramId);
     
-    // Registrar uso
     $nombreModelo = $modeloData ? $modeloData['modelo'] : 'Desconocido';
     $db->registrarUso($telegramId, $tac, $nombreModelo);
     
-    // Preparar respuesta con formato mejorado
     $respuesta = "╔═══════════════════════════╗\n";
     $respuesta .= "║  ✅ GENERACIÓN EXITOSA    ║\n";
     $respuesta .= "╚═══════════════════════════╝\n\n";
@@ -1107,15 +972,9 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
     $respuesta .= "📱 *DISPOSITIVO*\n";
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
     
-    // Mostrar modelo
-    if ($modeloData) {
-        $modeloTexto = $modeloData['modelo'];
-    } else {
-        $modeloTexto = "Desconocido";
-    }
+    $modeloTexto = $modeloData ? $modeloData['modelo'] : "Desconocido";
     $respuesta .= "📱 Modelo: *{$modeloTexto}*\n";
     
-    // Solo mostrar TAC a administradores
     if (esAdmin($telegramId)) {
         $respuesta .= "📡 TAC: `{$tac}`\n";
     }
@@ -1132,7 +991,6 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
     
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
     
-    // Mostrar créditos restantes
     $usuario = $db->getUsuario($telegramId);
     if (!$usuario['es_premium']) {
         $respuesta .= "💰 *CRÉDITOS*\n";
@@ -1151,7 +1009,6 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
     
     enviarMensaje($chatId, $respuesta);
     
-    // Si no tiene modelo, preguntar SOLO A ADMINISTRADORES
     if (!$modeloData && esAdmin($telegramId)) {
         $estados->setEstado($chatId, 'puede_agregar_modelo', ['tac' => $tac]);
         enviarMensaje($chatId, "\n👑 *¿Conoces el modelo?*\nComo administrador, puedes agregarlo enviando el modelo.\nEjemplo: _iPhone 13 Pro_");
@@ -1159,7 +1016,6 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
 }
 
 function procesarModelo($chatId, $modelo, $estados, $db, $telegramId) {
-    // Verificar que sea administrador
     if (!esAdmin($telegramId)) {
         return false;
     }
@@ -1173,7 +1029,6 @@ function procesarModelo($chatId, $modelo, $estados, $db, $telegramId) {
     $tac = $estado['datos']['tac'];
     $modeloLimpio = trim($modelo);
     
-    // Extraer marca
     $marca = '';
     $marcasConocidas = ['Apple', 'Samsung', 'Xiaomi', 'Huawei', 'Oppo', 'Vivo', 
                         'OnePlus', 'Motorola', 'Nokia', 'Sony', 'LG', 'Realme', 
@@ -1263,14 +1118,14 @@ function comandoPagosPendientes($chatId, $db) {
         $respuesta .= "📅 {$fecha}\n\n";
     }
     
+    $respuesta .= "Para ver detalles: `/detalle [ID]`\n";
     $respuesta .= "Para aprobar: `/aprobar [ID]`\n";
-    $respuesta .= "Para rechazar: `/rechazar [ID]`";
+    $respuesta .= "Para rechazar: `/rechazar [ID] [motivo]`";
     
     enviarMensaje($chatId, $respuesta);
 }
 
 function comandoAgregarCreditos($chatId, $texto, $adminId, $db) {
-    // Formato: /addcredits USER_ID CANTIDAD
     $partes = explode(' ', $texto);
     
     if (count($partes) != 3) {
@@ -1298,7 +1153,6 @@ function comandoAgregarCreditos($chatId, $texto, $adminId, $db) {
         $nuevoSaldo = $usuario['creditos'] + $cantidad;
         enviarMensaje($chatId, "✅ *Créditos agregados*\n\n👤 Usuario: {$usuario['first_name']}\n💰 Cantidad: +{$cantidad}\n💳 Nuevo saldo: {$nuevoSaldo}");
         
-        // Notificar al usuario
         enviarMensaje($targetUserId, "🎉 *¡Has recibido créditos!*\n\n💰 Se han agregado *{$cantidad} créditos* a tu cuenta\n💳 Nuevo saldo: {$nuevoSaldo} créditos\n\n¡Gracias por usar F4 Mobile IMEI Bot!");
     } else {
         enviarMensaje($chatId, "❌ Error al agregar créditos");
@@ -1306,7 +1160,6 @@ function comandoAgregarCreditos($chatId, $texto, $adminId, $db) {
 }
 
 function comandoBloquearUsuario($chatId, $texto, $db) {
-    // Formato: /block USER_ID
     $partes = explode(' ', $texto);
     
     if (count($partes) != 2) {
@@ -1325,7 +1178,6 @@ function comandoBloquearUsuario($chatId, $texto, $db) {
 }
 
 function comandoDesbloquearUsuario($chatId, $texto, $db) {
-    // Formato: /unblock USER_ID
     $partes = explode(' ', $texto);
     
     if (count($partes) != 2) {
@@ -1344,7 +1196,6 @@ function comandoDesbloquearUsuario($chatId, $texto, $db) {
 }
 
 function comandoHacerPremium($chatId, $texto, $db) {
-    // Formato: /premium USER_ID
     $partes = explode(' ', $texto);
     
     if (count($partes) != 2) {
@@ -1363,7 +1214,6 @@ function comandoHacerPremium($chatId, $texto, $db) {
 }
 
 function comandoQuitarPremium($chatId, $texto, $db) {
-    // Formato: /unpremium USER_ID
     $partes = explode(' ', $texto);
     
     if (count($partes) != 2) {
@@ -1381,48 +1231,7 @@ function comandoQuitarPremium($chatId, $texto, $db) {
     }
 }
 
-function comandoAprobarPago($chatId, $texto, $adminId, $db) {
-    // Formato: /aprobar ID
-    $partes = explode(' ', $texto);
-    
-    if (count($partes) != 2) {
-        enviarMensaje($chatId, "❌ Formato: `/aprobar [ID]`\n\nEjemplo: `/aprobar 5`");
-        return;
-    }
-    
-    $pagoId = intval($partes[1]);
-    
-    if ($db->aprobarPago($pagoId, $adminId)) {
-        enviarMensaje($chatId, "✅ Pago #$pagoId aprobado y créditos acreditados");
-    } else {
-        enviarMensaje($chatId, "❌ Error al aprobar pago. Verifica que el ID sea correcto y el pago esté pendiente.");
-    }
-}
-
-function comandoRechazarPago($chatId, $texto, $db) {
-    // Formato: /rechazar ID
-    $partes = explode(' ', $texto);
-    
-    if (count($partes) != 2) {
-        enviarMensaje($chatId, "❌ Formato: `/rechazar [ID]`\n\nEjemplo: `/rechazar 5`");
-        return;
-    }
-    
-    $pagoId = intval($partes[1]);
-    
-    if ($db->rechazarPago($pagoId)) {
-        enviarMensaje($chatId, "✅ Pago #$pagoId rechazado");
-    } else {
-        enviarMensaje($chatId, "❌ Error al rechazar pago");
-    }
-}
-
-// ============================================
-// COMANDOS DE GESTIÓN DE MODELOS (ADMIN)
-// ============================================
-
 function comandoAgregarModelo($chatId, $texto, $db) {
-    // Formato: /agregar_modelo TAC Modelo
     $partes = explode(' ', $texto, 3);
     
     if (count($partes) < 3) {
@@ -1438,7 +1247,6 @@ function comandoAgregarModelo($chatId, $texto, $db) {
         return;
     }
     
-    // Extraer marca
     $marca = '';
     $marcasConocidas = ['Apple', 'Samsung', 'Xiaomi', 'Huawei', 'Oppo', 'Vivo', 
                         'OnePlus', 'Motorola', 'Nokia', 'Sony', 'LG', 'Realme', 
@@ -1465,7 +1273,6 @@ function comandoAgregarModelo($chatId, $texto, $db) {
 }
 
 function comandoEditarModelo($chatId, $texto, $db) {
-    // Formato: /editar_modelo TAC Nuevo Modelo
     $partes = explode(' ', $texto, 3);
     
     if (count($partes) < 3) {
@@ -1481,7 +1288,6 @@ function comandoEditarModelo($chatId, $texto, $db) {
         return;
     }
     
-    // Extraer marca
     $marca = '';
     $marcasConocidas = ['Apple', 'Samsung', 'Xiaomi', 'Huawei', 'Oppo', 'Vivo', 
                         'OnePlus', 'Motorola', 'Nokia', 'Sony', 'LG', 'Realme', 
@@ -1507,7 +1313,6 @@ function comandoEditarModelo($chatId, $texto, $db) {
 }
 
 function comandoEliminarModelo($chatId, $texto, $db) {
-    // Formato: /eliminar_modelo TAC
     $partes = explode(' ', $texto);
     
     if (count($partes) < 2) {
@@ -1562,10 +1367,54 @@ function comandoLimpiarCache($chatId, $db) {
 }
 
 // ============================================
+// PROCESAMIENTO DE CALLBACKS
+// ============================================
+
+function procesarCallback($update, $db, $sistemaPagos, $estados) {
+    if (!isset($update['callback_query'])) return;
+    
+    $callbackQuery = $update['callback_query'];
+    $chatId = $callbackQuery['message']['chat']['id'];
+    $telegramId = $callbackQuery['from']['id'];
+    $data = $callbackQuery['data'];
+    
+    // Confirmar callback
+    $url = API_URL . 'answerCallbackQuery';
+    $postData = ['callback_query_id' => $callbackQuery['id']];
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'POST',
+            'header' => 'Content-Type: application/json',
+            'content' => json_encode($postData)
+        ]
+    ]);
+    @file_get_contents($url, false, $context);
+    
+    // Procesar según el tipo de callback
+    if (strpos($data, 'paquete_') === 0) {
+        $paqueteId = str_replace('paquete_', '', $data);
+        procesarSeleccionPaquete($chatId, $telegramId, $paqueteId, $db, $sistemaPagos, $estados);
+    }
+    elseif (strpos($data, 'metodo_') === 0) {
+        $parts = explode('_', $data);
+        $metodo = $parts[1];
+        $moneda = $parts[2];
+        procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db, $sistemaPagos, $estados);
+    }
+    elseif ($data === 'comprar_creditos') {
+        comandoComprarCreditosMejorado($chatId, $telegramId, $db, $sistemaPagos, $estados);
+    }
+    elseif ($data === 'ingresar_cupon') {
+        $estados->setEstado($chatId, 'ingresando_cupon', []);
+        enviarMensaje($chatId, "🎟️ *CUPÓN DE DESCUENTO*\n\nEnvía el código de tu cupón:");
+    }
+}
+
+// ============================================
 // PROCESAMIENTO DE ACTUALIZACIONES
 // ============================================
 
-function procesarActualizacion($update, $db, $estados) {
+function procesarActualizacion($update, $db, $estados, $sistemaPagos) {
     if (!isset($update['message'])) {
         return;
     }
@@ -1577,6 +1426,13 @@ function procesarActualizacion($update, $db, $estados) {
     
     $usuario = $db->getUsuario($telegramId);
     $esAdminUser = esAdmin($telegramId);
+    
+    // Procesar capturas de pago
+    if (isset($message['photo'])) {
+        if (procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos, $estados)) {
+            return; // Ya se procesó la captura
+        }
+    }
     
     // Comandos principales
     if ($texto == '/start') {
@@ -1593,7 +1449,7 @@ function procesarActualizacion($update, $db, $estados) {
         comandoHistorial($chatId, $telegramId, $db);
     }
     elseif ($texto == '💰 Comprar Créditos') {
-        comandoComprarCreditos($chatId);
+        comandoComprarCreditosMejorado($chatId, $telegramId, $db, $sistemaPagos, $estados);
     }
     elseif ($texto == '❓ Ayuda') {
         comandoAyuda($chatId);
@@ -1618,8 +1474,8 @@ function procesarActualizacion($update, $db, $estados) {
     elseif ($texto == '👥 Top Usuarios' && $esAdminUser) {
         comandoTopUsuarios($chatId, $db);
     }
-    elseif ($texto == '💸 Pagos Pendientes' && $esAdminUser) {
-        comandoPagosPendientes($chatId, $db);
+    elseif ($texto == '💸 Panel de Pagos' && $esAdminUser) {
+        comandoPanelPagosAdmin($chatId, $db, $sistemaPagos);
     }
     elseif ($texto == '➕ Agregar Créditos' && $esAdminUser) {
         enviarMensaje($chatId, "Para agregar créditos usa:\n`/addcredits [USER_ID] [CANTIDAD]`\n\nEjemplo:\n`/addcredits 123456789 50`");
@@ -1648,6 +1504,29 @@ function procesarActualizacion($update, $db, $estados) {
     elseif ($texto == '📡 Stats API' && $esAdminUser) {
         comandoEstadisticasAPI($chatId, $db);
     }
+    // Comandos de pagos admin
+    elseif (strpos($texto, '/pagos_pendientes') === 0 && $esAdminUser) {
+        comandoPagosPendientes($chatId, $db);
+    }
+    elseif (strpos($texto, '/detalle') === 0 && $esAdminUser) {
+        $partes = explode(' ', $texto);
+        if (isset($partes[1])) {
+            $pagoId = intval($partes[1]);
+            comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos);
+        }
+    }
+    elseif (strpos($texto, '/aprobar') === 0 && $esAdminUser) {
+        comandoAprobarPagoMejorado($chatId, $texto, $telegramId, $db, $sistemaPagos);
+    }
+    elseif (strpos($texto, '/rechazar') === 0 && $esAdminUser) {
+        comandoRechazarPagoMejorado($chatId, $texto, $telegramId, $db, $sistemaPagos);
+    }
+    elseif (strpos($texto, '/crear_cupon') === 0 && $esAdminUser) {
+        comandoCrearCupon($chatId, $texto, $telegramId, $db, $sistemaPagos);
+    }
+    elseif (strpos($texto, '/reporte_mes') === 0 && $esAdminUser) {
+        comandoReporteMensual($chatId, $db, $sistemaPagos);
+    }
     // Comandos admin directos
     elseif (strpos($texto, '/addcredits') === 0 && $esAdminUser) {
         comandoAgregarCreditos($chatId, $texto, $telegramId, $db);
@@ -1663,12 +1542,6 @@ function procesarActualizacion($update, $db, $estados) {
     }
     elseif (strpos($texto, '/unpremium') === 0 && $esAdminUser) {
         comandoQuitarPremium($chatId, $texto, $db);
-    }
-    elseif (strpos($texto, '/aprobar') === 0 && $esAdminUser) {
-        comandoAprobarPago($chatId, $texto, $telegramId, $db);
-    }
-    elseif (strpos($texto, '/rechazar') === 0 && $esAdminUser) {
-        comandoRechazarPago($chatId, $texto, $db);
     }
     // Comandos de gestión de modelos (solo admins)
     elseif (strpos($texto, '/agregar_modelo') === 0 && $esAdminUser) {
@@ -1688,6 +1561,14 @@ function procesarActualizacion($update, $db, $estados) {
     }
     // Procesamiento de texto libre (TAC o modelo)
     elseif (!empty($texto) && $texto[0] != '/') {
+        // Verificar si está en estado de ingresar cupón
+        $estado = $estados->getEstado($chatId);
+        if ($estado && $estado['estado'] === 'ingresando_cupon') {
+            comandoValidarCupon($chatId, $telegramId, $texto, $db, $sistemaPagos);
+            $estados->limpiarEstado($chatId);
+            return;
+        }
+        
         // Intentar como modelo primero
         $procesadoComoModelo = procesarModelo($chatId, $texto, $estados, $db, $telegramId);
         
@@ -1702,19 +1583,20 @@ function procesarActualizacion($update, $db, $estados) {
 // MODOS DE EJECUCIÓN
 // ============================================
 
-function modoWebhook($db, $estados) {
+function modoWebhook($db, $estados, $sistemaPagos) {
     $content = file_get_contents("php://input");
     $update = json_decode($content, true);
     
     if ($update) {
-        procesarActualizacion($update, $db, $estados);
+        procesarCallback($update, $db, $sistemaPagos, $estados);
+        procesarActualizacion($update, $db, $estados, $sistemaPagos);
     }
 }
 
-function modoPolling($db, $estados) {
+function modoPolling($db, $estados, $sistemaPagos) {
     $offset = 0;
     
-    echo "🤖 Bot con créditos iniciado\n";
+    echo "🤖 Bot con créditos y pagos iniciado\n";
     echo "Presiona Ctrl+C para detener\n\n";
     
     while (true) {
@@ -1724,7 +1606,8 @@ function modoPolling($db, $estados) {
         
         if (isset($updates['result'])) {
             foreach ($updates['result'] as $update) {
-                procesarActualizacion($update, $db, $estados);
+                procesarCallback($update, $db, $sistemaPagos, $estados);
+                procesarActualizacion($update, $db, $estados, $sistemaPagos);
                 $offset = $update['update_id'] + 1;
             }
         }
@@ -1741,14 +1624,30 @@ if (php_sapi_name() == 'cli') {
     if (isset($argv[1]) && $argv[1] == 'polling') {
         $db = new Database();
         $estados = new EstadosUsuario();
-        modoPolling($db, $estados);
+        $sistemaPagos = new SistemaPagos($db, BOT_TOKEN, ADMIN_IDS);
+        modoPolling($db, $estados, $sistemaPagos);
     } else {
-        echo "Uso: php bot_imei_creditos.php polling\n";
+        echo "Uso: php bot_imei_corregido.php polling\n";
     }
 } else {
     // Modo webhook
     $db = new Database();
     $estados = new EstadosUsuario();
-    modoWebhook($db, $estados);
+    $sistemaPagos = new SistemaPagos($db, BOT_TOKEN, ADMIN_IDS);
+    modoWebhook($db, $estados, $sistemaPagos);
+}
+function comandoPanelPagosAdmin($chatId, $db, $sistemaPagos) {
+    $stats = $sistemaPagos->obtenerEstadisticasPagos();
+    
+    $respuesta = "╔═══════════════════════════╗\n";
+    $respuesta .= "║  👑 PANEL DE PAGOS 👑     ║\n";
+    $respuesta .= "╚═══════════════════════════╝\n\n";
+    $respuesta .= "📊 *ESTADÍSTICAS*\n\n";
+    $respuesta .= "💳 Total: {$stats['total']}\n";
+    $respuesta .= "✅ Aprobados: {$stats['aprobados']}\n";
+    $respuesta .= "⏳ Pendientes: {$stats['pendientes']}\n\n";
+    $respuesta .= "Usa `/pagos_pendientes`";
+    
+    enviarMensaje($chatId, $respuesta);
 }
 ?>

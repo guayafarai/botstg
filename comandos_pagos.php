@@ -1,7 +1,7 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * COMANDOS DE PAGOS - VERSIÓN CORREGIDA CON FIX DE ESTADO
+ * COMANDOS DE PAGOS - VERSIÓN CORREGIDA CON FIX DE RECHAZO
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -667,16 +667,55 @@ function comandoAprobarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPago
     }
 }
 
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * FIX CRÍTICO: Comando de rechazo corregido
+ * ═══════════════════════════════════════════════════════════════
+ * 
+ * PROBLEMA ANTERIOR:
+ * - explode(' ', $texto, 3) requería exactamente 3 partes
+ * - Si el motivo no tenía espacios, count($partes) era 2
+ * - Por lo tanto, SIEMPRE daba error "Formato incorrecto"
+ * 
+ * SOLUCIÓN:
+ * - Cambiar a count($partes) < 2 (en vez de != 3)
+ * - Esto permite rechazar con motivo de una palabra O múltiples palabras
+ * 
+ * ═══════════════════════════════════════════════════════════════
+ */
 function comandoRechazarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPagos) {
+    // CORRECCIÓN: Dividir en máximo 3 partes (comando, ID, motivo completo)
     $partes = explode(' ', $texto, 3);
     
+    // CORRECCIÓN: Verificar que haya AL MENOS ID y motivo (mínimo 2 partes después del split)
+    // count($partes) puede ser:
+    // 1 = solo "/rechazar" -> ERROR
+    // 2 = "/rechazar 5" -> ERROR (falta motivo)
+    // 3 = "/rechazar 5 motivo" -> OK (puede ser una o más palabras)
     if (count($partes) < 3) {
-        enviarMensaje($chatId, "❌ Formato: `/rechazar [ID] [motivo]`\n\nEjemplo: `/rechazar 5 Monto incorrecto`");
+        enviarMensaje($chatId, "❌ *Formato incorrecto*\n\n*Uso:*\n`/rechazar [ID] [motivo]`\n\n*Ejemplos:*\n`/rechazar 5 Monto incorrecto`\n`/rechazar 5 El comprobante no coincide con el monto`");
         return;
     }
     
     $pagoId = intval($partes[1]);
-    $motivo = $partes[2];
+    $motivo = trim($partes[2]); // El motivo puede tener múltiples palabras
+    
+    // Validar que el motivo no esté vacío
+    if (empty($motivo)) {
+        enviarMensaje($chatId, "❌ *El motivo no puede estar vacío*\n\n*Ejemplo:*\n`/rechazar {$pagoId} Monto incorrecto`");
+        return;
+    }
+    
+    // Validar que el ID sea válido
+    if ($pagoId <= 0) {
+        enviarMensaje($chatId, "❌ *ID de pago inválido*\n\n*Ejemplo:*\n`/rechazar 5 Monto incorrecto`");
+        return;
+    }
+    
+    error_log("=== RECHAZANDO PAGO ===");
+    error_log("Pago ID: {$pagoId}");
+    error_log("Admin ID: {$adminId}");
+    error_log("Motivo: {$motivo}");
     
     $resultado = $sistemaPagos->rechazarPago($pagoId, $adminId, $motivo);
     
@@ -686,11 +725,15 @@ function comandoRechazarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPag
         $respuesta .= "📝 Motivo: {$motivo}\n\n";
         $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
         $respuesta .= "✅ Usuario notificado\n";
-        $respuesta .= "✅ Estado actualizado";
+        $respuesta .= "✅ Estado actualizado\n";
+        $respuesta .= "✅ Motivo guardado";
         
         enviarMensaje($chatId, $respuesta);
+        
+        error_log("Pago #{$pagoId} rechazado exitosamente");
     } else {
         enviarMensaje($chatId, "❌ Error: " . $resultado['mensaje']);
+        error_log("Error al rechazar pago #{$pagoId}: " . $resultado['mensaje']);
     }
 }
 

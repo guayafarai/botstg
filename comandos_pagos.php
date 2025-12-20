@@ -1,16 +1,15 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * COMANDOS DE PAGOS - VERSIÓN CON FIXES CRÍTICOS
+ * COMANDOS DE PAGOS - VERSIÓN TOTALMENTE CORREGIDA
  * ═══════════════════════════════════════════════════════════════
  */
 
 require_once(__DIR__ . '/sistema_pagos.php');
 
-// ═══════════════════════════════════════════════════════════════
-// FUNCIONES DE COMANDOS DE PAGO
-// ═══════════════════════════════════════════════════════════════
-
+/**
+ * Comando para mostrar paquetes y comprar créditos
+ */
 function comandoComprarCreditosMejorado($chatId, $telegramId, $db, $sistemaPagos, $estados) {
     $respuesta = "╔═══════════════════════════╗\n";
     $respuesta .= "║  💰 COMPRAR CRÉDITOS 💰   ║\n";
@@ -47,6 +46,9 @@ function comandoComprarCreditosMejorado($chatId, $telegramId, $db, $sistemaPagos
     enviarMensaje($chatId, $respuesta, 'Markdown', json_encode($keyboard));
 }
 
+/**
+ * Procesar selección de paquete
+ */
 function procesarSeleccionPaquete($chatId, $telegramId, $paqueteId, $db, $sistemaPagos, $estados) {
     $paquete = $sistemaPagos->obtenerPaquete($paqueteId);
     
@@ -98,6 +100,9 @@ function procesarSeleccionPaquete($chatId, $telegramId, $paqueteId, $db, $sistem
     enviarMensaje($chatId, $respuesta, 'Markdown', json_encode($keyboard));
 }
 
+/**
+ * Procesar selección de método de pago
+ */
 function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db, $sistemaPagos, $estados) {
     $estado = $estados->getEstado($chatId);
     
@@ -109,6 +114,12 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
     $paqueteId = $estado['datos']['paquete_id'];
     $paquete = $sistemaPagos->obtenerPaquete($paqueteId);
     
+    if (!$paquete) {
+        enviarMensaje($chatId, "❌ Error: Paquete no encontrado");
+        $estados->limpiarEstado($chatId);
+        return;
+    }
+    
     // Crear solicitud de pago
     $resultado = $sistemaPagos->crearSolicitudPago($telegramId, $paqueteId, $metodo, $moneda);
     
@@ -119,27 +130,25 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
     
     $pagoId = $resultado['pago_id'];
     
-    error_log("=== PAGO CREADO ===");
-    error_log("Pago ID: {$pagoId}");
+    logSecure("Pago #{$pagoId} creado para usuario {$telegramId}", 'INFO');
     
-    // Actualizar estado a 'esperando_captura' usando prepared statement
-    // FIX CRÍTICO #11: Prevenir SQL injection
-    $sqlUpdate = "UPDATE pagos_pendientes 
-                  SET estado = :estado 
-                  WHERE id = :pago_id";
-    
+    // Actualizar estado a esperando_captura en BD
     try {
-        $stmt = $db->conn->prepare($sqlUpdate);
-        $resultado_update = $stmt->execute([
+        $conn = $db->getConnection();
+        $sql = "UPDATE pagos_pendientes 
+                SET estado = :estado 
+                WHERE id = :pago_id";
+        
+        $stmt = $conn->prepare($sql);
+        $stmt->execute([
             ':estado' => 'esperando_captura',
-            ':pago_id' => $pagoId
+            ':pago_id' => (int)$pagoId
         ]);
         
-        error_log("UPDATE estado ejecutado - Resultado: " . ($resultado_update ? 'TRUE' : 'FALSE'));
-        error_log("Filas afectadas: " . $stmt->rowCount());
+        logSecure("Estado del pago #{$pagoId} actualizado a 'esperando_captura'", 'INFO');
         
     } catch(PDOException $e) {
-        error_log("ERROR al actualizar estado: " . $e->getMessage());
+        logSecure("Error al actualizar estado del pago: " . $e->getMessage(), 'ERROR');
     }
     
     // Actualizar estado del usuario
@@ -232,150 +241,145 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
 }
 
 /**
- * ═══════════════════════════════════════════════════════════════
- * FUNCIÓN CRÍTICA SIMPLIFICADA - Procesar captura de pago
- * FIX: Eliminada lógica redundante y múltiples actualizaciones
- * ═══════════════════════════════════════════════════════════════
+ * Procesar captura de pago - VERSIÓN CORREGIDA Y SIMPLIFICADA
  */
 function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos, $estados) {
     $estado = $estados->getEstado($chatId);
     
-    error_log("=== PROCESANDO CAPTURA ===");
-    error_log("Usuario: {$telegramId}");
-    error_log("Estado usuario: " . ($estado ? json_encode($estado) : 'NULL'));
+    logSecure("Procesando captura - Usuario: {$telegramId}, Estado: " . ($estado ? $estado['estado'] : 'NULL'), 'INFO');
     
     // Verificar estado del usuario
     if (!$estado || $estado['estado'] != 'esperando_pago') {
-        error_log("Usuario NO está esperando pago");
-        return false; // No está esperando captura
+        logSecure("Usuario {$telegramId} NO está esperando pago", 'DEBUG');
+        return false;
     }
     
     // Verificar que sea una foto
-    if (!isset($message['photo'])) {
+    if (!isset($message['photo']) || empty($message['photo'])) {
         enviarMensaje($chatId, "❌ Por favor envía una *imagen* (captura de pantalla)");
-        return true; // Procesado pero con error
+        return true;
     }
     
-    $pagoId = $estado['datos']['pago_id'];
-    error_log("Procesando pago ID: {$pagoId}");
+    $pagoId = $estado['datos']['pago_id'] ?? null;
     
-    // VERIFICACIÓN SIMPLIFICADA: Buscar el pago
-    $sql = "SELECT * FROM pagos_pendientes WHERE id = :pago_id AND telegram_id = :telegram_id";
+    if (!$pagoId) {
+        enviarMensaje($chatId, "❌ Error: No se encontró el ID de pago");
+        $estados->limpiarEstado($chatId);
+        return true;
+    }
+    
+    logSecure("Procesando pago #{$pagoId}", 'INFO');
+    
+    // Validar que el pago existe y pertenece al usuario
     try {
-        $stmt = $db->conn->prepare($sql);
+        $conn = $db->getConnection();
+        $sql = "SELECT * FROM pagos_pendientes 
+                WHERE id = :pago_id 
+                AND telegram_id = :telegram_id 
+                LIMIT 1";
+        
+        $stmt = $conn->prepare($sql);
         $stmt->execute([
-            ':pago_id' => $pagoId,
-            ':telegram_id' => $telegramId
+            ':pago_id' => (int)$pagoId,
+            ':telegram_id' => (int)$telegramId
         ]);
-        $pago = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        $pago = $stmt->fetch();
         
         if (!$pago) {
-            error_log("ERROR: Pago #{$pagoId} no encontrado");
-            enviarMensaje($chatId, "❌ Error: No se encontró el pago #" . $pagoId . "\n\n*Solución:*\nInicia nuevamente:\n💰 *Comprar Créditos*");
+            logSecure("ERROR: Pago #{$pagoId} no encontrado o no pertenece al usuario {$telegramId}", 'ERROR');
+            enviarMensaje($chatId, "❌ Error: Pago no encontrado\n\n*Solución:*\nInicia nuevamente:\n💰 *Comprar Créditos*");
             $estados->limpiarEstado($chatId);
             return true;
         }
         
-        error_log("Pago encontrado - Estado actual: '{$pago['estado']}'");
+        logSecure("Pago encontrado - Estado actual: '{$pago['estado']}'", 'INFO');
         
-        // VERIFICAR ESTADO: ¿Ya fue procesado?
+        // Verificar si ya fue procesado
         $estadosFinales = ['aprobado', 'rechazado', 'captura_enviada'];
         
         if (in_array($pago['estado'], $estadosFinales)) {
-            error_log("ADVERTENCIA: Pago ya en estado final: {$pago['estado']}");
+            logSecure("Pago #{$pagoId} ya procesado con estado: {$pago['estado']}", 'WARN');
             
-            $estadosMsg = [
-                'aprobado' => '✅ APROBADO - Créditos ya acreditados',
-                'rechazado' => '❌ RECHAZADO - Pago no válido',
-                'captura_enviada' => '📸 CAPTURA ENVIADA - Esperando validación'
+            $mensajes = [
+                'aprobado' => "✅ Tu pago ya fue aprobado y los créditos acreditados",
+                'rechazado' => "❌ Tu pago fue rechazado. Puedes intentar nuevamente",
+                'captura_enviada' => "📸 Tu captura ya fue enviada y está siendo validada"
             ];
             
-            $mensajeEstado = isset($estadosMsg[$pago['estado']]) ? $estadosMsg[$pago['estado']] : $pago['estado'];
+            $mensaje = $mensajes[$pago['estado']] ?? "Estado: {$pago['estado']}";
             
-            $respuesta = "⚠️ *PAGO YA PROCESADO*\n\n";
-            $respuesta .= "🆔 Orden: #{$pagoId}\n";
-            $respuesta .= "📊 Estado: *{$mensajeEstado}*\n\n";
-            
-            if ($pago['estado'] === 'captura_enviada') {
-                $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-                $respuesta .= "📸 Tu captura ya fue enviada\n";
-                $respuesta .= "⏳ Estamos validándola\n";
-                $respuesta .= "⏱️ Tiempo estimado: 1-24 horas\n\n";
-                $respuesta .= "💡 Te notificaremos cuando se apruebe";
-            } elseif ($pago['estado'] === 'aprobado') {
-                $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-                $respuesta .= "✅ Tus créditos ya fueron acreditados\n";
-                $respuesta .= "💎 Revisa tu saldo en:\n";
-                $respuesta .= "→ *💳 Mis Créditos*";
-            } else {
-                $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-                if (!empty($pago['motivo_rechazo'])) {
-                    $respuesta .= "📝 Motivo: {$pago['motivo_rechazo']}\n\n";
-                }
-                $respuesta .= "💡 Puedes hacer un nuevo intento:\n";
-                $respuesta .= "→ *💰 Comprar Créditos*";
-            }
-            
-            enviarMensaje($chatId, $respuesta);
+            enviarMensaje($chatId, "⚠️ *PAGO YA PROCESADO*\n\n{$mensaje}");
             $estados->limpiarEstado($chatId);
             return true;
         }
         
-        // VERIFICAR que el estado permite recibir captura
-        $estadosPermitidos = ['pendiente', 'esperando_captura'];
-        
-        if (!in_array($pago['estado'], $estadosPermitidos)) {
-            error_log("ERROR: Estado no permitido para captura: {$pago['estado']}");
-            enviarMensaje($chatId, "❌ Error: Estado de pago inválido\n\nContacta soporte: @CHAMOGSM");
+        // Verificar que el estado permita recibir captura
+        if (!in_array($pago['estado'], ['pendiente', 'esperando_captura'])) {
+            logSecure("Estado '{$pago['estado']}' no permite captura", 'ERROR');
+            enviarMensaje($chatId, "❌ Estado de pago inválido\n\nContacta soporte: @CHAMOGSM");
             $estados->limpiarEstado($chatId);
             return true;
         }
         
     } catch(PDOException $e) {
-        error_log("ERROR BD al buscar pago: " . $e->getMessage());
-        enviarMensaje($chatId, "❌ Error de base de datos\n\nContacta: @CHAMOGSM");
+        logSecure("Error BD al buscar pago: " . $e->getMessage(), 'ERROR');
+        enviarMensaje($chatId, "❌ Error de base de datos");
         return true;
     }
     
-    // Obtener file_id de la foto (la de mayor resolución)
+    // Obtener file_id de la foto (mejor resolución)
     $photos = $message['photo'];
     $photo = end($photos);
-    $fileId = $photo['file_id'];
+    $fileId = $photo['file_id'] ?? null;
     
-    $caption = isset($message['caption']) ? $message['caption'] : null;
-    
-    error_log("File ID obtenido: {$fileId}");
-    if ($caption) {
-        error_log("Caption: {$caption}");
+    if (!$fileId) {
+        enviarMensaje($chatId, "❌ Error: No se pudo obtener la imagen");
+        return true;
     }
     
-    // GUARDAR CAPTURA EN BASE DE DATOS (Una sola vez, sin verificaciones redundantes)
-    $sql = "UPDATE pagos_pendientes 
-            SET captura_file_id = :file_id, 
-                captura_caption = :caption,
-                fecha_captura = NOW(),
-                estado = 'captura_enviada'
-            WHERE id = :pago_id";
+    // Validar file_id (básico)
+    if (strlen($fileId) < 10 || strlen($fileId) > 200) {
+        logSecure("File ID inválido: longitud " . strlen($fileId), 'ERROR');
+        enviarMensaje($chatId, "❌ Error: Imagen inválida. Intenta de nuevo");
+        return true;
+    }
     
+    $caption = isset($message['caption']) ? htmlspecialchars($message['caption'], ENT_QUOTES, 'UTF-8') : null;
+    
+    logSecure("File ID obtenido: {$fileId}", 'INFO');
+    
+    // GUARDAR CAPTURA EN BD (una sola vez, con transacción)
     try {
-        $stmt = $db->conn->prepare($sql);
+        $db->beginTransaction();
+        
+        $sql = "UPDATE pagos_pendientes 
+                SET captura_file_id = :file_id, 
+                    captura_caption = :caption,
+                    fecha_captura = NOW(),
+                    estado = 'captura_enviada'
+                WHERE id = :pago_id
+                AND estado IN ('pendiente', 'esperando_captura')";
+        
+        $stmt = $conn->prepare($sql);
         $resultado = $stmt->execute([
             ':file_id' => $fileId,
             ':caption' => $caption,
-            ':pago_id' => $pagoId
+            ':pago_id' => (int)$pagoId
         ]);
         
         $filasAfectadas = $stmt->rowCount();
         
-        error_log("UPDATE ejecutado - Resultado: " . ($resultado ? 'TRUE' : 'FALSE'));
-        error_log("Filas afectadas: {$filasAfectadas}");
+        logSecure("UPDATE ejecutado - Filas afectadas: {$filasAfectadas}", 'INFO');
         
         if ($resultado && $filasAfectadas > 0) {
+            $db->commit();
+            
             // Limpiar estado del usuario
             $estados->limpiarEstado($chatId);
             
             // Notificar a administradores
-            notificarCapturaRecibidaDirecta($pagoId, $db, $fileId, BOT_TOKEN, ADMIN_IDS);
+            notificarCapturaRecibida($pagoId, $db, $fileId, BOT_TOKEN, ADMIN_IDS);
             
             // Mensaje de confirmación al usuario
             $respuesta = "✅ *¡CAPTURA RECIBIDA!*\n\n";
@@ -395,39 +399,42 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
             
             enviarMensaje($chatId, $respuesta);
             
-            error_log("=== CAPTURA GUARDADA EXITOSAMENTE ===");
+            logSecure("Captura guardada exitosamente para pago #{$pagoId}", 'INFO');
             return true;
             
         } else {
-            error_log("ERROR: No se actualizó ninguna fila en la BD");
-            enviarMensaje($chatId, "❌ Error al guardar captura\n\n*Debug Info:*\nPago ID: {$pagoId}\nFilas afectadas: {$filasAfectadas}\n\nContacta: @CHAMOGSM");
+            $db->rollBack();
+            logSecure("No se actualizó ninguna fila (posible race condition)", 'ERROR');
+            enviarMensaje($chatId, "❌ Error: El pago ya fue procesado\n\nContacta: @CHAMOGSM");
+            $estados->limpiarEstado($chatId);
             return true;
         }
         
     } catch(PDOException $e) {
-        error_log("ERROR SQL al guardar captura: " . $e->getMessage());
-        enviarMensaje($chatId, "❌ Error de base de datos:\n\n`{$e->getMessage()}`\n\nContacta: @CHAMOGSM");
+        $db->rollBack();
+        logSecure("Error SQL al guardar captura: " . $e->getMessage(), 'ERROR');
+        enviarMensaje($chatId, "❌ Error de base de datos\n\nContacta: @CHAMOGSM");
         return true;
     }
 }
 
 /**
- * Notificar a administradores sobre captura recibida
- * FIX CRÍTICO #10: Continuar notificando a todos los admins aunque falle uno
+ * Notificar a administradores - VERSIÓN CORREGIDA
  */
-function notificarCapturaRecibidaDirecta($pagoId, $db, $fileId, $botToken, $adminIds) {
-    $sql = "SELECT p.*, u.username, u.first_name 
-            FROM pagos_pendientes p
-            LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-            WHERE p.id = :id";
-    
+function notificarCapturaRecibida($pagoId, $db, $fileId, $botToken, $adminIds) {
     try {
-        $stmt = $db->conn->prepare($sql);
-        $stmt->execute([':id' => $pagoId]);
-        $pago = $stmt->fetch(PDO::FETCH_ASSOC);
+        $conn = $db->getConnection();
+        $sql = "SELECT p.*, u.username, u.first_name 
+                FROM pagos_pendientes p
+                LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
+                WHERE p.id = :id";
+        
+        $stmt = $conn->prepare($sql);
+        $stmt->execute([':id' => (int)$pagoId]);
+        $pago = $stmt->fetch();
         
         if (!$pago) {
-            error_log("ERROR: No se pudo obtener info del pago #{$pagoId} para notificar");
+            logSecure("No se pudo obtener info del pago #{$pagoId}", 'ERROR');
             return;
         }
         
@@ -444,97 +451,77 @@ function notificarCapturaRecibidaDirecta($pagoId, $db, $fileId, $botToken, $admi
         $mensaje .= "💳 Método: {$pago['metodo_pago']}\n\n";
         
         if (!empty($pago['captura_caption'])) {
-            $mensaje .= "📝 Nota del usuario:\n_{$pago['captura_caption']}_\n\n";
+            $mensaje .= "📝 Nota: {$pago['captura_caption']}\n\n";
         }
         
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        $mensaje .= "⚡ *COMANDOS RÁPIDOS*\n";
+        $mensaje .= "⚡ *COMANDOS*\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $mensaje .= "`/detalle {$pagoId}` - Ver detalles\n";
-        $mensaje .= "`/aprobar {$pagoId}` - Aprobar pago\n";
-        $mensaje .= "`/rechazar {$pagoId} motivo` - Rechazar";
+        $mensaje .= "`/detalle {$pagoId}`\n";
+        $mensaje .= "`/aprobar {$pagoId}`\n";
+        $mensaje .= "`/rechazar {$pagoId} [motivo]`";
         
         $apiUrl = "https://api.telegram.org/bot{$botToken}/";
         
-        // FIX CRÍTICO #10: Continuar con todos los admins aunque falle uno
         foreach ($adminIds as $adminId) {
-            try {
-                // Enviar mensaje de texto
-                $url = $apiUrl . 'sendMessage';
-                $data = [
-                    'chat_id' => $adminId,
-                    'text' => $mensaje,
-                    'parse_mode' => 'Markdown'
-                ];
-                
-                $options = [
-                    'http' => [
-                        'method' => 'POST',
-                        'header' => 'Content-Type: application/json',
-                        'content' => json_encode($data)
-                    ]
-                ];
-                
-                $context = stream_context_create($options);
-                $result = file_get_contents($url, false, $context);
-                
-                if ($result === false) {
-                    error_log("Error al enviar notificación a admin {$adminId} - " . error_get_last()['message']);
-                    continue; // Continuar con el siguiente admin
-                }
-                
-                $response = json_decode($result, true);
-                if (!isset($response['ok']) || !$response['ok']) {
-                    error_log("Telegram API error para admin {$adminId}: " . ($response['description'] ?? 'Unknown'));
-                    continue; // Continuar con el siguiente admin
-                }
-                
-                error_log("Notificación enviada a admin {$adminId}");
-                
-                // Enviar foto (captura)
-                $url = $apiUrl . 'sendPhoto';
-                $data = [
-                    'chat_id' => $adminId,
-                    'photo' => $fileId,
-                    'caption' => "📸 Captura de pago #{$pagoId}\n\nPara aprobar: `/aprobar {$pagoId}`",
-                    'parse_mode' => 'Markdown'
-                ];
-                
-                $options = [
-                    'http' => [
-                        'method' => 'POST',
-                        'header' => 'Content-Type: application/json',
-                        'content' => json_encode($data)
-                    ]
-                ];
-                
-                $context = stream_context_create($options);
-                $result = file_get_contents($url, false, $context);
-                
-                if ($result === false) {
-                    error_log("Error al enviar foto a admin {$adminId} - " . error_get_last()['message']);
-                    continue; // Continuar con el siguiente admin
-                }
-                
-                $response = json_decode($result, true);
-                if (!isset($response['ok']) || !$response['ok']) {
-                    error_log("Telegram API error (foto) para admin {$adminId}: " . ($response['description'] ?? 'Unknown'));
-                    continue;
-                }
-                
-                error_log("Foto enviada a admin {$adminId}");
-                
-            } catch (Exception $e) {
-                error_log("Excepción al notificar admin {$adminId}: " . $e->getMessage());
-                continue; // Continuar con el siguiente admin
+            // Enviar mensaje
+            $url = $apiUrl . 'sendMessage';
+            $data = [
+                'chat_id' => $adminId,
+                'text' => $mensaje,
+                'parse_mode' => 'Markdown'
+            ];
+            
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => json_encode($data),
+                CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+                CURLOPT_TIMEOUT => 10
+            ]);
+            
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            
+            if ($response === false || $httpCode !== 200) {
+                logSecure("Error al notificar admin {$adminId}", 'ERROR');
+                continue;
             }
+            
+            // Enviar foto
+            $url = $apiUrl . 'sendPhoto';
+            $data = [
+                'chat_id' => $adminId,
+                'photo' => $fileId,
+                'caption' => "📸 Captura pago #{$pagoId}\n\n`/aprobar {$pagoId}`",
+                'parse_mode' => 'Markdown'
+            ];
+            
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => json_encode($data),
+                CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+                CURLOPT_TIMEOUT => 10
+            ]);
+            
+            curl_exec($ch);
+            curl_close($ch);
+            
+            logSecure("Admin {$adminId} notificado correctamente", 'INFO');
         }
         
-    } catch(PDOException $e) {
-        error_log("ERROR al obtener datos para notificar admins: " . $e->getMessage());
+    } catch(Exception $e) {
+        logSecure("Error al notificar admins: " . $e->getMessage(), 'ERROR');
     }
 }
 
+/**
+ * Comando para ver detalle de pago
+ */
 function comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos) {
     $pago = $sistemaPagos->obtenerDetallePago($pagoId);
     
@@ -558,47 +545,17 @@ function comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos) {
     $respuesta .= "• ID: `{$pago['telegram_id']}`\n";
     $respuesta .= "• Créditos actuales: {$pago['creditos_actuales']}\n\n";
     
-    $respuesta .= "💰 *DETALLES DE COMPRA*\n";
+    $respuesta .= "💰 *DETALLES*\n";
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
     $respuesta .= "• Paquete: {$pago['paquete']}\n";
     $respuesta .= "• Créditos: {$pago['creditos']}\n";
     $respuesta .= "• Monto: {$pago['monto']} {$pago['moneda']}\n";
     $respuesta .= "• Método: {$pago['metodo_pago']}\n\n";
     
-    $estadoEmoji = [
-        'pendiente' => '⏳',
-        'esperando_captura' => '📸',
-        'captura_enviada' => '📸',
-        'aprobado' => '✅',
-        'rechazado' => '❌'
-    ];
-    
-    $emoji = isset($estadoEmoji[$pago['estado']]) ? $estadoEmoji[$pago['estado']] : '📋';
-    
-    $respuesta .= "📊 *ESTADO*\n";
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    $respuesta .= "{$emoji} " . strtoupper($pago['estado']) . "\n";
-    
-    if (!empty($pago['fecha_captura'])) {
-        $respuesta .= "📸 Captura: " . date('d/m H:i', strtotime($pago['fecha_captura'])) . "\n";
-    }
-    
-    if (!empty($pago['fecha_aprobacion'])) {
-        $respuesta .= "✅ Aprobado: " . date('d/m H:i', strtotime($pago['fecha_aprobacion'])) . "\n";
-    }
+    $respuesta .= "📊 *ESTADO*: {$pago['estado']}\n";
     
     if (!empty($pago['motivo_rechazo'])) {
         $respuesta .= "\n📝 Motivo rechazo:\n{$pago['motivo_rechazo']}";
-    }
-    
-    $respuesta .= "\n\n⚡ *ACCIONES*\n";
-    $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    
-    if (in_array($pago['estado'], ['captura_enviada', 'esperando_captura'])) {
-        $respuesta .= "`/aprobar {$pago['id']}`\n";
-        $respuesta .= "`/rechazar {$pago['id']} [motivo]`";
-    } else {
-        $respuesta .= "Estado final - No hay acciones disponibles";
     }
     
     enviarMensaje($chatId, $respuesta);
@@ -607,46 +564,51 @@ function comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos) {
     if (!empty($pago['captura_file_id'])) {
         $url = "https://api.telegram.org/bot" . BOT_TOKEN . "/sendPhoto";
         
-        $data = [
-            'chat_id' => $chatId,
-            'photo' => $pago['captura_file_id'],
-            'caption' => "📸 Captura del pago #{$pago['id']}"
-        ];
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode([
+                'chat_id' => $chatId,
+                'photo' => $pago['captura_file_id'],
+                'caption' => "📸 Captura del pago #{$pago['id']}"
+            ]),
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_TIMEOUT => 10
+        ]);
         
-        $options = [
-            'http' => [
-                'method' => 'POST',
-                'header' => 'Content-Type: application/json',
-                'content' => json_encode($data)
-            ]
-        ];
-        
-        $context = stream_context_create($options);
-        @file_get_contents($url, false, $context);
+        curl_exec($ch);
+        curl_close($ch);
     }
 }
 
+/**
+ * Comando para aprobar pago
+ */
 function comandoAprobarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPagos) {
     $partes = explode(' ', $texto, 3);
     
     if (count($partes) < 2) {
-        enviarMensaje($chatId, "❌ Formato: `/aprobar [ID] [notas opcionales]`\n\nEjemplo: `/aprobar 5`");
+        enviarMensaje($chatId, "❌ Formato: `/aprobar [ID] [notas]`\n\nEjemplo: `/aprobar 5`");
         return;
     }
     
     $pagoId = intval($partes[1]);
     $notas = isset($partes[2]) ? $partes[2] : null;
     
+    if ($pagoId <= 0) {
+        enviarMensaje($chatId, "❌ ID inválido");
+        return;
+    }
+    
     $resultado = $sistemaPagos->aprobarPago($pagoId, $adminId, $notas);
     
     if ($resultado['exito']) {
         $respuesta = "✅ *PAGO APROBADO*\n\n";
-        $respuesta .= "🆔 Pago ID: #{$pagoId}\n";
-        $respuesta .= "💎 Créditos agregados: {$resultado['creditos_agregados']}\n\n";
-        $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        $respuesta .= "🆔 Pago: #{$pagoId}\n";
+        $respuesta .= "💎 Créditos: {$resultado['creditos_agregados']}\n\n";
         $respuesta .= "✅ Usuario notificado\n";
-        $respuesta .= "✅ Créditos acreditados\n";
-        $respuesta .= "✅ Transacción registrada";
+        $respuesta .= "✅ Créditos acreditados";
         
         enviarMensaje($chatId, $respuesta);
     } else {
@@ -654,49 +616,41 @@ function comandoAprobarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPago
     }
 }
 
+/**
+ * Comando para rechazar pago
+ */
 function comandoRechazarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPagos) {
     $partes = explode(' ', $texto, 3);
     
     if (count($partes) < 3) {
-        enviarMensaje($chatId, "❌ *Formato incorrecto*\n\n*Uso:*\n`/rechazar [ID] [motivo]`\n\n*Ejemplos:*\n`/rechazar 5 Monto incorrecto`\n`/rechazar 5 El comprobante no coincide con el monto`");
+        enviarMensaje($chatId, "❌ Formato: `/rechazar [ID] [motivo]`\n\nEjemplo:\n`/rechazar 5 Monto incorrecto`");
         return;
     }
     
     $pagoId = intval($partes[1]);
     $motivo = trim($partes[2]);
     
-    if (empty($motivo)) {
-        enviarMensaje($chatId, "❌ *El motivo no puede estar vacío*\n\n*Ejemplo:*\n`/rechazar {$pagoId} Monto incorrecto`");
-        return;
-    }
-    
     if ($pagoId <= 0) {
-        enviarMensaje($chatId, "❌ *ID de pago inválido*\n\n*Ejemplo:*\n`/rechazar 5 Monto incorrecto`");
+        enviarMensaje($chatId, "❌ ID inválido");
         return;
     }
     
-    error_log("=== RECHAZANDO PAGO ===");
-    error_log("Pago ID: {$pagoId}");
-    error_log("Admin ID: {$adminId}");
-    error_log("Motivo: {$motivo}");
+    if (empty($motivo)) {
+        enviarMensaje($chatId, "❌ Debes especificar un motivo");
+        return;
+    }
     
     $resultado = $sistemaPagos->rechazarPago($pagoId, $adminId, $motivo);
     
     if ($resultado['exito']) {
         $respuesta = "❌ *PAGO RECHAZADO*\n\n";
-        $respuesta .= "🆔 Pago ID: #{$pagoId}\n";
+        $respuesta .= "🆔 Pago: #{$pagoId}\n";
         $respuesta .= "📝 Motivo: {$motivo}\n\n";
-        $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $respuesta .= "✅ Usuario notificado\n";
-        $respuesta .= "✅ Estado actualizado\n";
-        $respuesta .= "✅ Motivo guardado";
+        $respuesta .= "✅ Usuario notificado";
         
         enviarMensaje($chatId, $respuesta);
-        
-        error_log("Pago #{$pagoId} rechazado exitosamente");
     } else {
         enviarMensaje($chatId, "❌ Error: " . $resultado['mensaje']);
-        error_log("Error al rechazar pago #{$pagoId}: " . $resultado['mensaje']);
     }
 }
 

@@ -1,8 +1,7 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * SISTEMA COMPLETO DE PAGOS - BOT TELEGRAM IMEI
- * VERSIÓN CON FIXES CRÍTICOS APLICADOS
+ * SISTEMA COMPLETO DE PAGOS - VERSIÓN CORREGIDA
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -10,8 +9,9 @@ class SistemaPagos {
     private $db;
     private $botToken;
     private $adminIds;
+    private $rateLimiter = [];
     
-    // Paquetes de créditos disponibles
+    // Paquetes de créditos
     private $paquetes = [
         'basico' => [
             'nombre' => '🥉 BÁSICO',
@@ -55,7 +55,7 @@ class SistemaPagos {
         ]
     ];
     
-    // Métodos de pago disponibles
+    // Métodos de pago
     private $metodosPago = [
         'yape' => [
             'nombre' => 'Yape (Perú)',
@@ -78,7 +78,7 @@ class SistemaPagos {
             'emoji' => '🌐',
             'email' => 'pagos@chamogsm.com',
             'monedas' => ['USD'],
-            'instrucciones' => 'Envía a través de PayPal y comparte el ID de transacción'
+            'instrucciones' => 'Envía a través de PayPal y comparte el ID'
         ],
         'binance' => [
             'nombre' => 'Binance Pay',
@@ -92,28 +92,72 @@ class SistemaPagos {
             'emoji' => '💎',
             'address' => 'TXx...xyz',
             'monedas' => ['USDT'],
-            'instrucciones' => 'Envía USDT a la dirección y comparte el hash'
+            'instrucciones' => 'Envía USDT a la dirección'
         ]
     ];
     
     public function __construct($database, $botToken, $adminIds) {
         $this->db = $database;
         $this->botToken = $botToken;
-        $this->adminIds = $adminIds;
+        $this->adminIds = is_array($adminIds) ? $adminIds : [$adminIds];
     }
     
-    // ═══════════════════════════════════════
-    // GESTIÓN DE PAQUETES
-    // ═══════════════════════════════════════
-    
-    public function obtenerPaquetes($moneda = 'USD') {
-        return $this->paquetes;
+    /**
+     * Validar rate limit
+     */
+    private function checkRateLimit($userId, $action, $limit = 5, $window = 60) {
+        $key = "{$userId}_{$action}";
+        $now = time();
+        
+        if (!isset($this->rateLimiter[$key])) {
+            $this->rateLimiter[$key] = [];
+        }
+        
+        // Limpiar requests antiguos
+        $this->rateLimiter[$key] = array_filter(
+            $this->rateLimiter[$key],
+            function($timestamp) use ($now, $window) {
+                return ($now - $timestamp) < $window;
+            }
+        );
+        
+        if (count($this->rateLimiter[$key]) >= $limit) {
+            return false;
+        }
+        
+        $this->rateLimiter[$key][] = $now;
+        return true;
     }
     
+    /**
+     * Obtener paquete por ID
+     */
     public function obtenerPaquete($id) {
         return isset($this->paquetes[$id]) ? $this->paquetes[$id] : null;
     }
     
+    /**
+     * Obtener todos los paquetes
+     */
+    public function obtenerPaquetes() {
+        return $this->paquetes;
+    }
+    
+    /**
+     * Obtener métodos de pago
+     */
+    public function obtenerMetodosPago($moneda = null) {
+        if ($moneda) {
+            return array_filter($this->metodosPago, function($metodo) use ($moneda) {
+                return in_array($moneda, $metodo['monedas']);
+            });
+        }
+        return $this->metodosPago;
+    }
+    
+    /**
+     * Mostrar paquetes formateados
+     */
     public function mostrarPaquetes($moneda = 'PEN') {
         $mensaje = "╔═══════════════════════════╗\n";
         $mensaje .= "║  💰 PAQUETES DE CRÉDITOS  ║\n";
@@ -137,91 +181,68 @@ class SistemaPagos {
         return $mensaje;
     }
     
-    // ═══════════════════════════════════════
-    // MÉTODOS DE PAGO
-    // ═══════════════════════════════════════
-    
-    public function obtenerMetodosPago($moneda = null) {
-        if ($moneda) {
-            return array_filter($this->metodosPago, function($metodo) use ($moneda) {
-                return in_array($moneda, $metodo['monedas']);
-            });
-        }
-        return $this->metodosPago;
-    }
-    
-    public function mostrarMetodosPago($moneda = 'PEN') {
-        $metodos = $this->obtenerMetodosPago($moneda);
-        
-        $mensaje = "╔═══════════════════════════╗\n";
-        $mensaje .= "║   💳 MÉTODOS DE PAGO      ║\n";
-        $mensaje .= "╚═══════════════════════════╝\n\n";
-        
-        foreach ($metodos as $id => $metodo) {
-            $mensaje .= "{$metodo['emoji']} *{$metodo['nombre']}*\n";
-            
-            if (isset($metodo['numero'])) {
-                $mensaje .= "📱 Número: `{$metodo['numero']}`\n";
-                $mensaje .= "👤 Titular: {$metodo['titular']}\n";
-            }
-            
-            if (isset($metodo['email'])) {
-                $mensaje .= "📧 Email: `{$metodo['email']}`\n";
-            }
-            
-            if (isset($metodo['address'])) {
-                $mensaje .= "🔗 Dirección: `{$metodo['address']}`\n";
-            }
-            
-            if (isset($metodo['id'])) {
-                $mensaje .= "🆔 ID: `{$metodo['id']}`\n";
-            }
-            
-            $mensaje .= "\n";
-        }
-        
-        return $mensaje;
-    }
-    
-    // ═══════════════════════════════════════
-    // CREACIÓN DE SOLICITUD DE PAGO
-    // FIX CRÍTICO #4: Validar que el usuario existe
-    // ═══════════════════════════════════════
-    
+    /**
+     * Crear solicitud de pago con validaciones
+     */
     public function crearSolicitudPago($telegramId, $paqueteId, $metodoPago, $moneda) {
-        // FIX CRÍTICO #4: Verificar que el usuario existe antes de crear el pago
+        // Validar rate limit
+        if (!$this->checkRateLimit($telegramId, 'crear_pago', 3, 300)) {
+            return [
+                'exito' => false, 
+                'mensaje' => 'Demasiadas solicitudes. Espera un momento.'
+            ];
+        }
+        
+        // Validar que el usuario existe
         $usuario = $this->db->getUsuario($telegramId);
         if (!$usuario) {
-            error_log("ERROR: Intento de crear pago para usuario inexistente: {$telegramId}");
-            return ['exito' => false, 'mensaje' => 'Usuario no encontrado. Usa /start primero.'];
+            return [
+                'exito' => false, 
+                'mensaje' => 'Usuario no encontrado. Usa /start primero.'
+            ];
         }
         
+        // Validar paquete
         $paquete = $this->obtenerPaquete($paqueteId);
-        
         if (!$paquete) {
             return ['exito' => false, 'mensaje' => 'Paquete no válido'];
         }
         
+        // Validar método de pago
+        if (!isset($this->metodosPago[$metodoPago])) {
+            return ['exito' => false, 'mensaje' => 'Método de pago no válido'];
+        }
+        
+        // Validar moneda
+        if (!in_array($moneda, ['PEN', 'USD', 'USDT'])) {
+            return ['exito' => false, 'mensaje' => 'Moneda no válida'];
+        }
+        
         $precio = $moneda === 'PEN' ? $paquete['precio_pen'] : $paquete['precio_usd'];
         
-        // Crear registro en base de datos
-        $sql = "INSERT INTO pagos_pendientes 
-                (telegram_id, paquete, creditos, monto, moneda, metodo_pago, estado, fecha_solicitud)
-                VALUES 
-                (:telegram_id, :paquete, :creditos, :monto, :moneda, :metodo_pago, 'pendiente', NOW())";
-        
+        // Crear registro con transacción
         try {
-            $stmt = $this->db->conn->prepare($sql);
+            $this->db->beginTransaction();
+            
+            $sql = "INSERT INTO pagos_pendientes 
+                    (telegram_id, paquete, creditos, monto, moneda, metodo_pago, estado, fecha_solicitud)
+                    VALUES 
+                    (:telegram_id, :paquete, :creditos, :monto, :moneda, :metodo_pago, 'pendiente', NOW())";
+            
+            $conn = $this->db->getConnection();
+            $stmt = $conn->prepare($sql);
             $stmt->execute([
-                ':telegram_id' => $telegramId,
+                ':telegram_id' => (int)$telegramId,
                 ':paquete' => $paqueteId,
-                ':creditos' => $paquete['creditos'],
-                ':monto' => $precio,
+                ':creditos' => (int)$paquete['creditos'],
+                ':monto' => (float)$precio,
                 ':moneda' => $moneda,
                 ':metodo_pago' => $metodoPago
             ]);
             
-            $pagoId = $this->db->conn->lastInsertId();
+            $pagoId = $conn->lastInsertId();
+            
+            $this->db->commit();
             
             // Notificar a administradores
             $this->notificarNuevaSolicitud($pagoId, $telegramId, $paquete, $precio, $moneda, $metodoPago);
@@ -233,89 +254,37 @@ class SistemaPagos {
             ];
             
         } catch(PDOException $e) {
-            error_log("Error al crear solicitud de pago: " . $e->getMessage());
-            return ['exito' => false, 'mensaje' => 'Error al crear solicitud: ' . $e->getMessage()];
+            $this->db->rollBack();
+            logSecure("Error al crear solicitud de pago: " . $e->getMessage(), 'ERROR');
+            return ['exito' => false, 'mensaje' => 'Error al crear solicitud'];
         }
     }
     
-    // ═══════════════════════════════════════
-    // GESTIÓN DE CAPTURAS
-    // ═══════════════════════════════════════
-    
-    public function guardarCaptura($pagoId, $fileId, $caption = null) {
-        $sql = "UPDATE pagos_pendientes 
-                SET captura_file_id = :file_id, 
-                    captura_caption = :caption,
-                    fecha_captura = NOW(),
-                    estado = 'captura_enviada'
-                WHERE id = :pago_id";
-        
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([
-                ':file_id' => $fileId,
-                ':caption' => $caption,
-                ':pago_id' => $pagoId
-            ]);
-            
-            // Notificar a administradores
-            $this->notificarCapturaRecibida($pagoId);
-            
-            return true;
-        } catch(PDOException $e) {
-            error_log("Error al guardar captura: " . $e->getMessage());
-            return false;
-        }
-    }
-    
-    public function obtenerPagoPendiente($telegramId) {
-        $sql = "SELECT * FROM pagos_pendientes 
-                WHERE telegram_id = :telegram_id 
-                AND estado IN ('pendiente', 'esperando_captura')
-                ORDER BY fecha_solicitud DESC 
-                LIMIT 1";
-        
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':telegram_id' => $telegramId]);
-            return $stmt->fetch(PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            error_log("Error al obtener pago pendiente: " . $e->getMessage());
-            return false;
-        }
-    }
-    
-    // ═══════════════════════════════════════
-    // VALIDACIÓN Y APROBACIÓN
-    // ═══════════════════════════════════════
-    
+    /**
+     * Aprobar pago con validaciones y transacción
+     */
     public function aprobarPago($pagoId, $adminId, $notasAdmin = null) {
-        error_log("=== INICIANDO APROBACIÓN DE PAGO ===");
-        error_log("Pago ID: {$pagoId}");
-        error_log("Admin ID: {$adminId}");
-        
-        // Obtener información del pago
-        $sql = "SELECT * FROM pagos_pendientes WHERE id = :id";
+        logSecure("Iniciando aprobación de pago #{$pagoId} por admin {$adminId}", 'INFO');
         
         try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':id' => $pagoId]);
-            $pago = $stmt->fetch(PDO::FETCH_ASSOC);
+            $this->db->beginTransaction();
+            
+            // Obtener y bloquear el pago
+            $conn = $this->db->getConnection();
+            $sql = "SELECT * FROM pagos_pendientes WHERE id = :id FOR UPDATE";
+            $stmt = $conn->prepare($sql);
+            $stmt->execute([':id' => (int)$pagoId]);
+            $pago = $stmt->fetch();
             
             if (!$pago) {
-                error_log("ERROR: Pago no encontrado");
+                $this->db->rollBack();
                 return ['exito' => false, 'mensaje' => 'Pago no encontrado'];
             }
             
-            error_log("Pago encontrado - Estado actual: {$pago['estado']}");
-            
             if ($pago['estado'] === 'aprobado') {
-                error_log("ADVERTENCIA: Pago ya aprobado");
+                $this->db->rollBack();
                 return ['exito' => false, 'mensaje' => 'Este pago ya fue aprobado'];
             }
-            
-            // Iniciar transacción
-            $this->db->conn->beginTransaction();
             
             // Actualizar estado del pago
             $sql = "UPDATE pagos_pendientes 
@@ -325,27 +294,23 @@ class SistemaPagos {
                         notas_admin = :notas
                     WHERE id = :id";
             
-            $stmt = $this->db->conn->prepare($sql);
-            $result = $stmt->execute([
-                ':id' => $pagoId,
-                ':admin_id' => $adminId,
+            $stmt = $conn->prepare($sql);
+            $stmt->execute([
+                ':id' => (int)$pagoId,
+                ':admin_id' => (int)$adminId,
                 ':notas' => $notasAdmin
             ]);
             
-            if (!$result) {
-                throw new Exception("Error al actualizar estado del pago");
-            }
-            
-            error_log("Estado del pago actualizado a 'aprobado'");
-            
-            // Agregar créditos al usuario
-            $creditosAgregados = $this->db->actualizarCreditos($pago['telegram_id'], $pago['creditos'], 'add');
+            // Agregar créditos
+            $creditosAgregados = $this->db->actualizarCreditos(
+                $pago['telegram_id'], 
+                $pago['creditos'], 
+                'add'
+            );
             
             if (!$creditosAgregados) {
-                throw new Exception("Error al agregar créditos al usuario");
+                throw new Exception("Error al agregar créditos");
             }
-            
-            error_log("Créditos agregados: {$pago['creditos']}");
             
             // Registrar transacción
             $this->db->registrarTransaccion(
@@ -356,14 +321,12 @@ class SistemaPagos {
                 $adminId
             );
             
-            error_log("Transacción registrada");
-            
-            $this->db->conn->commit();
-            
-            error_log("Transacción completada exitosamente");
+            $this->db->commit();
             
             // Notificar al usuario
             $this->notificarPagoAprobado($pago);
+            
+            logSecure("Pago #{$pagoId} aprobado exitosamente", 'INFO');
             
             return [
                 'exito' => true,
@@ -372,42 +335,43 @@ class SistemaPagos {
             ];
             
         } catch(Exception $e) {
-            $this->db->conn->rollBack();
-            error_log("ERROR en aprobarPago: " . $e->getMessage());
-            return ['exito' => false, 'mensaje' => 'Error al aprobar pago: ' . $e->getMessage()];
+            $this->db->rollBack();
+            logSecure("Error al aprobar pago #{$pagoId}: " . $e->getMessage(), 'ERROR');
+            return ['exito' => false, 'mensaje' => 'Error al aprobar pago'];
         }
     }
     
+    /**
+     * Rechazar pago
+     */
     public function rechazarPago($pagoId, $adminId, $motivo) {
-        error_log("=== INICIANDO RECHAZO DE PAGO ===");
-        error_log("Pago ID: {$pagoId}");
-        error_log("Admin ID: {$adminId}");
-        error_log("Motivo: {$motivo}");
+        logSecure("Iniciando rechazo de pago #{$pagoId} por admin {$adminId}", 'INFO');
         
-        // Obtener información del pago
-        $sql = "SELECT * FROM pagos_pendientes WHERE id = :id";
+        if (empty($motivo)) {
+            return ['exito' => false, 'mensaje' => 'Debes especificar un motivo'];
+        }
         
         try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':id' => $pagoId]);
-            $pago = $stmt->fetch(PDO::FETCH_ASSOC);
+            $this->db->beginTransaction();
+            
+            // Obtener y bloquear el pago
+            $conn = $this->db->getConnection();
+            $sql = "SELECT * FROM pagos_pendientes WHERE id = :id FOR UPDATE";
+            $stmt = $conn->prepare($sql);
+            $stmt->execute([':id' => (int)$pagoId]);
+            $pago = $stmt->fetch();
             
             if (!$pago) {
-                error_log("ERROR: Pago no encontrado");
+                $this->db->rollBack();
                 return ['exito' => false, 'mensaje' => 'Pago no encontrado'];
             }
             
-            error_log("Pago encontrado - Estado actual: '{$pago['estado']}'");
-            error_log("Telegram ID: {$pago['telegram_id']}");
-            error_log("Paquete: {$pago['paquete']}");
-            
-            // Verificar si ya fue rechazado
             if ($pago['estado'] === 'rechazado') {
-                error_log("ADVERTENCIA: Pago ya rechazado");
+                $this->db->rollBack();
                 return ['exito' => false, 'mensaje' => 'Este pago ya fue rechazado'];
             }
             
-            // Actualizar estado del pago
+            // Actualizar estado
             $sql = "UPDATE pagos_pendientes 
                     SET estado = 'rechazado',
                         fecha_rechazo = NOW(),
@@ -415,148 +379,92 @@ class SistemaPagos {
                         motivo_rechazo = :motivo
                     WHERE id = :id";
             
-            $stmt = $this->db->conn->prepare($sql);
-            $result = $stmt->execute([
-                ':id' => $pagoId,
-                ':admin_id' => $adminId,
-                ':motivo' => $motivo
+            $stmt = $conn->prepare($sql);
+            $stmt->execute([
+                ':id' => (int)$pagoId,
+                ':admin_id' => (int)$adminId,
+                ':motivo' => htmlspecialchars($motivo, ENT_QUOTES, 'UTF-8')
             ]);
             
-            if (!$result) {
-                error_log("ERROR: No se pudo ejecutar UPDATE");
-                return ['exito' => false, 'mensaje' => 'Error al ejecutar actualización'];
-            }
-            
-            $filasAfectadas = $stmt->rowCount();
-            error_log("Filas afectadas por UPDATE: {$filasAfectadas}");
-            
-            if ($filasAfectadas === 0) {
-                error_log("ADVERTENCIA: No se actualizó ninguna fila");
-                return ['exito' => false, 'mensaje' => 'No se pudo actualizar el pago'];
-            }
-            
-            error_log("Estado actualizado a 'rechazado'");
+            $this->db->commit();
             
             // Notificar al usuario
             $this->notificarPagoRechazado($pago, $motivo);
             
-            error_log("Usuario notificado");
-            error_log("=== RECHAZO COMPLETADO EXITOSAMENTE ===");
+            logSecure("Pago #{$pagoId} rechazado exitosamente", 'INFO');
             
-            return [
-                'exito' => true, 
-                'mensaje' => 'Pago rechazado exitosamente'
-            ];
+            return ['exito' => true, 'mensaje' => 'Pago rechazado exitosamente'];
             
-        } catch(PDOException $e) {
-            error_log("ERROR SQL en rechazarPago: " . $e->getMessage());
-            error_log("SQL State: " . $e->getCode());
-            return ['exito' => false, 'mensaje' => 'Error de base de datos: ' . $e->getMessage()];
         } catch(Exception $e) {
-            error_log("ERROR GENERAL en rechazarPago: " . $e->getMessage());
-            return ['exito' => false, 'mensaje' => 'Error: ' . $e->getMessage()];
+            $this->db->rollBack();
+            logSecure("Error al rechazar pago #{$pagoId}: " . $e->getMessage(), 'ERROR');
+            return ['exito' => false, 'mensaje' => 'Error al rechazar pago'];
         }
     }
     
-    // ═══════════════════════════════════════
-    // SISTEMA DE CUPONES/DESCUENTOS
-    // ═══════════════════════════════════════
-    
-    public function crearCupon($codigo, $descuentoPorcentaje, $usoMaximo = 1, $fechaExpiracion = null) {
-        $sql = "INSERT INTO cupones 
-                (codigo, descuento_porcentaje, uso_maximo, fecha_expiracion, activo)
-                VALUES 
-                (:codigo, :descuento, :uso_maximo, :expiracion, 1)";
+    /**
+     * Obtener detalle de pago
+     */
+    public function obtenerDetallePago($pagoId) {
+        $sql = "SELECT p.*, u.username, u.first_name, u.creditos as creditos_actuales
+                FROM pagos_pendientes p
+                LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
+                WHERE p.id = :id";
         
         try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([
-                ':codigo' => strtoupper($codigo),
-                ':descuento' => $descuentoPorcentaje,
-                ':uso_maximo' => $usoMaximo,
-                ':expiracion' => $fechaExpiracion
-            ]);
-            
-            return true;
+            $conn = $this->db->getConnection();
+            $stmt = $conn->prepare($sql);
+            $stmt->execute([':id' => (int)$pagoId]);
+            return $stmt->fetch();
         } catch(PDOException $e) {
-            error_log("Error al crear cupón: " . $e->getMessage());
+            logSecure("Error al obtener detalle de pago: " . $e->getMessage(), 'ERROR');
             return false;
         }
     }
     
-    public function validarCupon($codigo, $telegramId) {
-        $sql = "SELECT * FROM cupones 
-                WHERE codigo = :codigo 
-                AND activo = 1
-                AND (fecha_expiracion IS NULL OR fecha_expiracion > NOW())
-                AND uso_actual < uso_maximo";
+    /**
+     * Enviar mensaje de Telegram con manejo de errores
+     */
+    private function enviarMensaje($chatId, $texto, $parseMode = 'Markdown') {
+        $url = "https://api.telegram.org/bot{$this->botToken}/sendMessage";
         
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':codigo' => strtoupper($codigo)]);
-            $cupon = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$cupon) {
-                return ['valido' => false, 'mensaje' => 'Cupón no válido o expirado'];
-            }
-            
-            // Verificar si el usuario ya usó este cupón
-            $sql = "SELECT COUNT(*) as usos FROM pagos_pendientes 
-                    WHERE telegram_id = :telegram_id 
-                    AND cupon_codigo = :codigo";
-            
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([
-                ':telegram_id' => $telegramId,
-                ':codigo' => $cupon['codigo']
-            ]);
-            
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($result['usos'] > 0) {
-                return ['valido' => false, 'mensaje' => 'Ya has usado este cupón'];
-            }
-            
-            return [
-                'valido' => true,
-                'descuento' => $cupon['descuento_porcentaje'],
-                'codigo' => $cupon['codigo']
-            ];
-            
-        } catch(PDOException $e) {
-            error_log("Error al validar cupón: " . $e->getMessage());
-            return ['valido' => false, 'mensaje' => 'Error al validar cupón'];
-        }
-    }
-    
-    public function aplicarCupon($pagoId, $cuponCodigo) {
-        $sql = "UPDATE pagos_pendientes 
-                SET cupon_codigo = :codigo 
-                WHERE id = :pago_id";
+        $data = [
+            'chat_id' => $chatId,
+            'text' => $texto,
+            'parse_mode' => $parseMode
+        ];
         
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([
-                ':codigo' => $cuponCodigo,
-                ':pago_id' => $pagoId
-            ]);
-            
-            // Incrementar uso del cupón
-            $sql = "UPDATE cupones SET uso_actual = uso_actual + 1 WHERE codigo = :codigo";
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':codigo' => $cuponCodigo]);
-            
-            return true;
-        } catch(PDOException $e) {
-            error_log("Error al aplicar cupón: " . $e->getMessage());
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($data),
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_TIMEOUT => 10
+        ]);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+        
+        if ($response === false || $httpCode !== 200) {
+            logSecure("Error al enviar mensaje a {$chatId}: " . $error, 'ERROR');
             return false;
         }
+        
+        $result = json_decode($response, true);
+        if (!isset($result['ok']) || !$result['ok']) {
+            logSecure("Telegram API error: " . ($result['description'] ?? 'Unknown'), 'ERROR');
+            return false;
+        }
+        
+        return true;
     }
     
-    // ═══════════════════════════════════════
-    // NOTIFICACIONES (CON FIX CRÍTICO #7)
-    // ═══════════════════════════════════════
-    
+    /**
+     * Notificar nueva solicitud
+     */
     private function notificarNuevaSolicitud($pagoId, $telegramId, $paquete, $precio, $moneda, $metodoPago) {
         $usuario = $this->db->getUsuario($telegramId);
         $username = $usuario['username'] ? "@{$usuario['username']}" : $usuario['first_name'];
@@ -578,53 +486,9 @@ class SistemaPagos {
         }
     }
     
-    private function notificarCapturaRecibida($pagoId) {
-        $sql = "SELECT p.*, u.username, u.first_name 
-                FROM pagos_pendientes p
-                LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-                WHERE p.id = :id";
-        
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':id' => $pagoId]);
-            $pago = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$pago) return;
-            
-            $username = $pago['username'] ? "@{$pago['username']}" : $pago['first_name'];
-            
-            $mensaje = "📸 *CAPTURA DE PAGO RECIBIDA*\n\n";
-            $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-            $mensaje .= "🆔 Pago ID: #{$pagoId}\n";
-            $mensaje .= "👤 Usuario: {$username}\n";
-            $mensaje .= "📦 Paquete: {$pago['paquete']}\n";
-            $mensaje .= "💰 Monto: {$pago['monto']} {$pago['moneda']}\n";
-            $mensaje .= "💳 Método: {$pago['metodo_pago']}\n\n";
-            
-            if ($pago['captura_caption']) {
-                $mensaje .= "📝 Nota: {$pago['captura_caption']}\n\n";
-            }
-            
-            $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-            $mensaje .= "⚡ Comandos:\n";
-            $mensaje .= "`/aprobar {$pagoId}` - Aprobar pago\n";
-            $mensaje .= "`/rechazar {$pagoId} [motivo]` - Rechazar pago\n";
-            $mensaje .= "`/detalle {$pagoId}` - Ver detalles";
-            
-            foreach ($this->adminIds as $adminId) {
-                // Enviar mensaje
-                $this->enviarMensaje($adminId, $mensaje);
-                
-                // Reenviar la captura
-                if ($pago['captura_file_id']) {
-                    $this->enviarFoto($adminId, $pago['captura_file_id']);
-                }
-            }
-        } catch(PDOException $e) {
-            error_log("Error al notificar captura recibida: " . $e->getMessage());
-        }
-    }
-    
+    /**
+     * Notificar pago aprobado
+     */
     private function notificarPagoAprobado($pago) {
         $mensaje = "✅ *¡PAGO APROBADO!*\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
@@ -640,6 +504,9 @@ class SistemaPagos {
         $this->enviarMensaje($pago['telegram_id'], $mensaje);
     }
     
+    /**
+     * Notificar pago rechazado
+     */
     private function notificarPagoRechazado($pago, $motivo) {
         $mensaje = "❌ *PAGO RECHAZADO*\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
@@ -658,172 +525,6 @@ class SistemaPagos {
         
         $this->enviarMensaje($pago['telegram_id'], $mensaje);
     }
-    
-    // ═══════════════════════════════════════
-    // ESTADÍSTICAS Y REPORTES
-    // ═══════════════════════════════════════
-    
-    public function obtenerEstadisticasPagos() {
-        $stats = [];
-        
-        try {
-            // Total de pagos
-            $sql = "SELECT 
-                    COUNT(*) as total,
-                    SUM(CASE WHEN estado = 'aprobado' THEN 1 ELSE 0 END) as aprobados,
-                    SUM(CASE WHEN estado = 'rechazado' THEN 1 ELSE 0 END) as rechazados,
-                    SUM(CASE WHEN estado IN ('pendiente', 'captura_enviada') THEN 1 ELSE 0 END) as pendientes,
-                    SUM(CASE WHEN estado = 'aprobado' THEN monto ELSE 0 END) as ingresos_usd,
-                    SUM(CASE WHEN estado = 'aprobado' THEN creditos ELSE 0 END) as creditos_vendidos
-                    FROM pagos_pendientes";
-            
-            $stmt = $this->db->conn->query($sql);
-            $stats = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            // Pagos por método
-            $sql = "SELECT metodo_pago, COUNT(*) as total 
-                    FROM pagos_pendientes 
-                    WHERE estado = 'aprobado'
-                    GROUP BY metodo_pago";
-            
-            $stmt = $this->db->conn->query($sql);
-            $stats['por_metodo'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            // Pagos recientes
-            $sql = "SELECT DATE(fecha_solicitud) as fecha, COUNT(*) as total, SUM(monto) as ingresos
-                    FROM pagos_pendientes 
-                    WHERE estado = 'aprobado'
-                    AND fecha_solicitud >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-                    GROUP BY DATE(fecha_solicitud)
-                    ORDER BY fecha DESC";
-            
-            $stmt = $this->db->conn->query($sql);
-            $stats['ultimos_30_dias'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            return $stats;
-            
-        } catch(PDOException $e) {
-            error_log("Error al obtener estadísticas: " . $e->getMessage());
-            return [];
-        }
-    }
-    
-    public function generarReporteMensual($mes = null, $anio = null) {
-        if (!$mes) $mes = date('m');
-        if (!$anio) $anio = date('Y');
-        
-        $sql = "SELECT 
-                p.*,
-                u.username,
-                u.first_name
-                FROM pagos_pendientes p
-                LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-                WHERE MONTH(p.fecha_solicitud) = :mes
-                AND YEAR(p.fecha_solicitud) = :anio
-                AND p.estado = 'aprobado'
-                ORDER BY p.fecha_aprobacion DESC";
-        
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':mes' => $mes, ':anio' => $anio]);
-            return $stmt->fetchAll(PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            error_log("Error al generar reporte mensual: " . $e->getMessage());
-            return [];
-        }
-    }
-    
-    // ═══════════════════════════════════════
-    // FUNCIONES AUXILIARES (CON FIX CRÍTICO #7)
-    // ═══════════════════════════════════════
-    
-    private function enviarMensaje($chatId, $texto, $parseMode = 'Markdown') {
-        $url = "https://api.telegram.org/bot{$this->botToken}/sendMessage";
-        
-        $data = [
-            'chat_id' => $chatId,
-            'text' => $texto,
-            'parse_mode' => $parseMode
-        ];
-        
-        $options = [
-            'http' => [
-                'method' => 'POST',
-                'header' => 'Content-Type: application/json',
-                'content' => json_encode($data)
-            ]
-        ];
-        
-        $context = stream_context_create($options);
-        
-        // FIX CRÍTICO #7: No silenciar errores y validar respuesta
-        $response = file_get_contents($url, false, $context);
-        
-        if ($response === false) {
-            $error = error_get_last();
-            error_log("Error al enviar mensaje a chat {$chatId}: " . ($error['message'] ?? 'Unknown error'));
-            return false;
-        }
-        
-        $result = json_decode($response, true);
-        if (!isset($result['ok']) || !$result['ok']) {
-            error_log("Telegram API error para chat {$chatId}: " . ($result['description'] ?? 'Unknown error'));
-            return false;
-        }
-        
-        return $response;
-    }
-    
-    private function enviarFoto($chatId, $fileId) {
-        $url = "https://api.telegram.org/bot{$this->botToken}/sendPhoto";
-        
-        $data = [
-            'chat_id' => $chatId,
-            'photo' => $fileId
-        ];
-        
-        $options = [
-            'http' => [
-                'method' => 'POST',
-                'header' => 'Content-Type: application/json',
-                'content' => json_encode($data)
-            ]
-        ];
-        
-        $context = stream_context_create($options);
-        
-        // FIX CRÍTICO #7: No silenciar errores y validar respuesta
-        $response = file_get_contents($url, false, $context);
-        
-        if ($response === false) {
-            $error = error_get_last();
-            error_log("Error al enviar foto a chat {$chatId}: " . ($error['message'] ?? 'Unknown error'));
-            return false;
-        }
-        
-        $result = json_decode($response, true);
-        if (!isset($result['ok']) || !$result['ok']) {
-            error_log("Telegram API error (foto) para chat {$chatId}: " . ($result['description'] ?? 'Unknown error'));
-            return false;
-        }
-        
-        return $response;
-    }
-    
-    public function obtenerDetallePago($pagoId) {
-        $sql = "SELECT p.*, u.username, u.first_name, u.creditos as creditos_actuales
-                FROM pagos_pendientes p
-                LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-                WHERE p.id = :id";
-        
-        try {
-            $stmt = $this->db->conn->prepare($sql);
-            $stmt->execute([':id' => $pagoId]);
-            return $stmt->fetch(PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            error_log("Error al obtener detalle de pago: " . $e->getMessage());
-            return false;
-        }
-    }
 }
+
 ?>

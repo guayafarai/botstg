@@ -4,7 +4,7 @@
  * CLASE PARA INTEGRACIÓN CON API DE IMEIDB.XYZ
  * ═══════════════════════════════════════════════════════════════
  * 
- * VERSIÓN 3.0 - Integración con imeidb.xyz
+ * VERSIÓN 3.1 - CORREGIDA - Acceso correcto a conexión BD
  * 
  * API: https://imeidb.xyz
  * Documentación: https://imeidb.xyz/docs
@@ -400,6 +400,7 @@ class IMEIDbAPI {
     
     /**
      * Obtiene datos del caché
+     * CORREGIDO: Usar getConnection() en lugar de acceso directo
      */
     private function obtenerDeCache($imei) {
         $sql = "SELECT * FROM api_cache 
@@ -407,7 +408,8 @@ class IMEIDbAPI {
                 AND TIMESTAMPDIFF(SECOND, fecha_consulta, NOW()) < :cache_time";
         
         try {
-            $stmt = $this->db->conn->prepare($sql);
+            $conn = $this->db->getConnection();
+            $stmt = $conn->prepare($sql);
             $stmt->execute([
                 ':imei' => $imei,
                 ':cache_time' => $this->cacheTime
@@ -427,6 +429,7 @@ class IMEIDbAPI {
     
     /**
      * Guarda datos en el caché
+     * CORREGIDO: Usar getConnection() en lugar de acceso directo
      */
     private function guardarEnCache($imei, $datos) {
         $sql = "INSERT INTO api_cache (imei, datos, fecha_consulta)
@@ -436,7 +439,8 @@ class IMEIDbAPI {
                     fecha_consulta = NOW()";
         
         try {
-            $stmt = $this->db->conn->prepare($sql);
+            $conn = $this->db->getConnection();
+            $stmt = $conn->prepare($sql);
             $datosJson = json_encode($datos);
             
             $stmt->execute([
@@ -453,6 +457,7 @@ class IMEIDbAPI {
     
     /**
      * Limpia el caché antiguo
+     * CORREGIDO: Usar getConnection() en lugar de acceso directo
      * 
      * @param int $diasAntiguedad Días de antigüedad para limpiar
      * @return int Número de registros eliminados
@@ -462,7 +467,8 @@ class IMEIDbAPI {
                 WHERE TIMESTAMPDIFF(DAY, fecha_consulta, NOW()) > :dias";
         
         try {
-            $stmt = $this->db->conn->prepare($sql);
+            $conn = $this->db->getConnection();
+            $stmt = $conn->prepare($sql);
             $stmt->execute([':dias' => $diasAntiguedad]);
             return $stmt->rowCount();
         } catch(PDOException $e) {
@@ -472,6 +478,7 @@ class IMEIDbAPI {
     
     /**
      * Obtiene estadísticas del uso de la API
+     * CORREGIDO: Usar getConnection() en lugar de acceso directo
      * 
      * @return array Estadísticas
      */
@@ -483,7 +490,8 @@ class IMEIDbAPI {
                 FROM api_cache";
         
         try {
-            $stmt = $this->db->conn->query($sql);
+            $conn = $this->db->getConnection();
+            $stmt = $conn->query($sql);
             return $stmt->fetch(PDO::FETCH_ASSOC);
         } catch(PDOException $e) {
             return [

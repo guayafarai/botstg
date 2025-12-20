@@ -1,7 +1,7 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * COMANDOS DE PAGOS - VERSIÓN CORREGIDA CON FIX DE RECHAZO
+ * COMANDOS DE PAGOS - VERSIÓN CON FIXES CRÍTICOS
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -122,41 +122,25 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
     error_log("=== PAGO CREADO ===");
     error_log("Pago ID: {$pagoId}");
     
-    // ══════════════════════════════════════════════════════════════════
-    // FIX CRÍTICO: Forzar el estado a 'esperando_captura' INMEDIATAMENTE
-    // ══════════════════════════════════════════════════════════════════
+    // Actualizar estado a 'esperando_captura' usando prepared statement
+    // FIX CRÍTICO #11: Prevenir SQL injection
     $sqlUpdate = "UPDATE pagos_pendientes 
-                  SET estado = 'esperando_captura' 
+                  SET estado = :estado 
                   WHERE id = :pago_id";
     
     try {
         $stmt = $db->conn->prepare($sqlUpdate);
-        $resultado_update = $stmt->execute([':pago_id' => $pagoId]);
+        $resultado_update = $stmt->execute([
+            ':estado' => 'esperando_captura',
+            ':pago_id' => $pagoId
+        ]);
         
         error_log("UPDATE estado ejecutado - Resultado: " . ($resultado_update ? 'TRUE' : 'FALSE'));
         error_log("Filas afectadas: " . $stmt->rowCount());
         
-        // Verificar que se actualizó correctamente
-        $sqlVerify = "SELECT estado FROM pagos_pendientes WHERE id = :pago_id";
-        $stmtVerify = $db->conn->prepare($sqlVerify);
-        $stmtVerify->execute([':pago_id' => $pagoId]);
-        $estadoActual = $stmtVerify->fetch(PDO::FETCH_ASSOC);
-        
-        error_log("Estado después del UPDATE: '" . $estadoActual['estado'] . "'");
-        
-        if (empty($estadoActual['estado']) || $estadoActual['estado'] !== 'esperando_captura') {
-            error_log("ERROR CRÍTICO: Estado no se actualizó correctamente!");
-            
-            // Intentar actualización forzada alternativa
-            $db->conn->exec("UPDATE pagos_pendientes SET estado = 'esperando_captura' WHERE id = {$pagoId}");
-            
-            error_log("Actualización forzada ejecutada");
-        }
-        
     } catch(PDOException $e) {
         error_log("ERROR al actualizar estado: " . $e->getMessage());
     }
-    // ══════════════════════════════════════════════════════════════════
     
     // Actualizar estado del usuario
     $estados->setEstado($chatId, 'esperando_pago', [
@@ -248,7 +232,10 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
 }
 
 /**
- * FUNCIÓN CRÍTICA CORREGIDA - Procesar captura de pago
+ * ═══════════════════════════════════════════════════════════════
+ * FUNCIÓN CRÍTICA SIMPLIFICADA - Procesar captura de pago
+ * FIX: Eliminada lógica redundante y múltiples actualizaciones
+ * ═══════════════════════════════════════════════════════════════
  */
 function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos, $estados) {
     $estado = $estados->getEstado($chatId);
@@ -272,7 +259,7 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
     $pagoId = $estado['datos']['pago_id'];
     error_log("Procesando pago ID: {$pagoId}");
     
-    // VERIFICACIÓN MEJORADA: Buscar el pago y verificar su estado
+    // VERIFICACIÓN SIMPLIFICADA: Buscar el pago
     $sql = "SELECT * FROM pagos_pendientes WHERE id = :pago_id AND telegram_id = :telegram_id";
     try {
         $stmt = $db->conn->prepare($sql);
@@ -291,34 +278,12 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         
         error_log("Pago encontrado - Estado actual: '{$pago['estado']}'");
         
-        // ══════════════════════════════════════════════════════════════
-        // FIX CRÍTICO: Si el estado está vacío, forzarlo ahora
-        // ══════════════════════════════════════════════════════════════
-        if (empty($pago['estado'])) {
-            error_log("ADVERTENCIA: Estado vacío detectado - FORZANDO a 'esperando_captura'");
-            
-            $sqlFix = "UPDATE pagos_pendientes SET estado = 'esperando_captura' WHERE id = :pago_id";
-            $stmtFix = $db->conn->prepare($sqlFix);
-            $stmtFix->execute([':pago_id' => $pagoId]);
-            
-            // Re-leer el pago
-            $stmt->execute([
-                ':pago_id' => $pagoId,
-                ':telegram_id' => $telegramId
-            ]);
-            $pago = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            error_log("Estado después del fix: '{$pago['estado']}'");
-        }
-        // ══════════════════════════════════════════════════════════════
-        
-        // VERIFICACIÓN CRÍTICA: ¿El pago ya fue procesado?
+        // VERIFICAR ESTADO: ¿Ya fue procesado?
         $estadosFinales = ['aprobado', 'rechazado', 'captura_enviada'];
         
         if (in_array($pago['estado'], $estadosFinales)) {
             error_log("ADVERTENCIA: Pago ya en estado final: {$pago['estado']}");
             
-            // Mapeo de estados a mensajes
             $estadosMsg = [
                 'aprobado' => '✅ APROBADO - Créditos ya acreditados',
                 'rechazado' => '❌ RECHAZADO - Pago no válido',
@@ -356,7 +321,7 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
             return true;
         }
         
-        // Si el estado NO es final, verificar que sea válido para recibir captura
+        // VERIFICAR que el estado permite recibir captura
         $estadosPermitidos = ['pendiente', 'esperando_captura'];
         
         if (!in_array($pago['estado'], $estadosPermitidos)) {
@@ -384,7 +349,7 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         error_log("Caption: {$caption}");
     }
     
-    // GUARDAR CAPTURA EN BASE DE DATOS
+    // GUARDAR CAPTURA EN BASE DE DATOS (Una sola vez, sin verificaciones redundantes)
     $sql = "UPDATE pagos_pendientes 
             SET captura_file_id = :file_id, 
                 captura_caption = :caption,
@@ -448,6 +413,7 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
 
 /**
  * Notificar a administradores sobre captura recibida
+ * FIX CRÍTICO #10: Continuar notificando a todos los admins aunque falle uno
  */
 function notificarCapturaRecibidaDirecta($pagoId, $db, $fileId, $botToken, $adminIds) {
     $sql = "SELECT p.*, u.username, u.first_name 
@@ -490,56 +456,77 @@ function notificarCapturaRecibidaDirecta($pagoId, $db, $fileId, $botToken, $admi
         
         $apiUrl = "https://api.telegram.org/bot{$botToken}/";
         
+        // FIX CRÍTICO #10: Continuar con todos los admins aunque falle uno
         foreach ($adminIds as $adminId) {
-            // Enviar mensaje de texto
-            $url = $apiUrl . 'sendMessage';
-            $data = [
-                'chat_id' => $adminId,
-                'text' => $mensaje,
-                'parse_mode' => 'Markdown'
-            ];
-            
-            $options = [
-                'http' => [
-                    'method' => 'POST',
-                    'header' => 'Content-Type: application/json',
-                    'content' => json_encode($data)
-                ]
-            ];
-            
-            $context = stream_context_create($options);
-            $result = @file_get_contents($url, false, $context);
-            
-            if ($result) {
+            try {
+                // Enviar mensaje de texto
+                $url = $apiUrl . 'sendMessage';
+                $data = [
+                    'chat_id' => $adminId,
+                    'text' => $mensaje,
+                    'parse_mode' => 'Markdown'
+                ];
+                
+                $options = [
+                    'http' => [
+                        'method' => 'POST',
+                        'header' => 'Content-Type: application/json',
+                        'content' => json_encode($data)
+                    ]
+                ];
+                
+                $context = stream_context_create($options);
+                $result = file_get_contents($url, false, $context);
+                
+                if ($result === false) {
+                    error_log("Error al enviar notificación a admin {$adminId} - " . error_get_last()['message']);
+                    continue; // Continuar con el siguiente admin
+                }
+                
+                $response = json_decode($result, true);
+                if (!isset($response['ok']) || !$response['ok']) {
+                    error_log("Telegram API error para admin {$adminId}: " . ($response['description'] ?? 'Unknown'));
+                    continue; // Continuar con el siguiente admin
+                }
+                
                 error_log("Notificación enviada a admin {$adminId}");
-            } else {
-                error_log("Error al enviar notificación a admin {$adminId}");
-            }
-            
-            // Enviar foto (captura)
-            $url = $apiUrl . 'sendPhoto';
-            $data = [
-                'chat_id' => $adminId,
-                'photo' => $fileId,
-                'caption' => "📸 Captura de pago #{$pagoId}\n\nPara aprobar: `/aprobar {$pagoId}`",
-                'parse_mode' => 'Markdown'
-            ];
-            
-            $options = [
-                'http' => [
-                    'method' => 'POST',
-                    'header' => 'Content-Type: application/json',
-                    'content' => json_encode($data)
-                ]
-            ];
-            
-            $context = stream_context_create($options);
-            $result = @file_get_contents($url, false, $context);
-            
-            if ($result) {
+                
+                // Enviar foto (captura)
+                $url = $apiUrl . 'sendPhoto';
+                $data = [
+                    'chat_id' => $adminId,
+                    'photo' => $fileId,
+                    'caption' => "📸 Captura de pago #{$pagoId}\n\nPara aprobar: `/aprobar {$pagoId}`",
+                    'parse_mode' => 'Markdown'
+                ];
+                
+                $options = [
+                    'http' => [
+                        'method' => 'POST',
+                        'header' => 'Content-Type: application/json',
+                        'content' => json_encode($data)
+                    ]
+                ];
+                
+                $context = stream_context_create($options);
+                $result = file_get_contents($url, false, $context);
+                
+                if ($result === false) {
+                    error_log("Error al enviar foto a admin {$adminId} - " . error_get_last()['message']);
+                    continue; // Continuar con el siguiente admin
+                }
+                
+                $response = json_decode($result, true);
+                if (!isset($response['ok']) || !$response['ok']) {
+                    error_log("Telegram API error (foto) para admin {$adminId}: " . ($response['description'] ?? 'Unknown'));
+                    continue;
+                }
+                
                 error_log("Foto enviada a admin {$adminId}");
-            } else {
-                error_log("Error al enviar foto a admin {$adminId}");
+                
+            } catch (Exception $e) {
+                error_log("Excepción al notificar admin {$adminId}: " . $e->getMessage());
+                continue; // Continuar con el siguiente admin
             }
         }
         
@@ -667,46 +654,22 @@ function comandoAprobarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPago
     }
 }
 
-/**
- * ═══════════════════════════════════════════════════════════════
- * FIX CRÍTICO: Comando de rechazo corregido
- * ═══════════════════════════════════════════════════════════════
- * 
- * PROBLEMA ANTERIOR:
- * - explode(' ', $texto, 3) requería exactamente 3 partes
- * - Si el motivo no tenía espacios, count($partes) era 2
- * - Por lo tanto, SIEMPRE daba error "Formato incorrecto"
- * 
- * SOLUCIÓN:
- * - Cambiar a count($partes) < 2 (en vez de != 3)
- * - Esto permite rechazar con motivo de una palabra O múltiples palabras
- * 
- * ═══════════════════════════════════════════════════════════════
- */
 function comandoRechazarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPagos) {
-    // CORRECCIÓN: Dividir en máximo 3 partes (comando, ID, motivo completo)
     $partes = explode(' ', $texto, 3);
     
-    // CORRECCIÓN: Verificar que haya AL MENOS ID y motivo (mínimo 2 partes después del split)
-    // count($partes) puede ser:
-    // 1 = solo "/rechazar" -> ERROR
-    // 2 = "/rechazar 5" -> ERROR (falta motivo)
-    // 3 = "/rechazar 5 motivo" -> OK (puede ser una o más palabras)
     if (count($partes) < 3) {
         enviarMensaje($chatId, "❌ *Formato incorrecto*\n\n*Uso:*\n`/rechazar [ID] [motivo]`\n\n*Ejemplos:*\n`/rechazar 5 Monto incorrecto`\n`/rechazar 5 El comprobante no coincide con el monto`");
         return;
     }
     
     $pagoId = intval($partes[1]);
-    $motivo = trim($partes[2]); // El motivo puede tener múltiples palabras
+    $motivo = trim($partes[2]);
     
-    // Validar que el motivo no esté vacío
     if (empty($motivo)) {
         enviarMensaje($chatId, "❌ *El motivo no puede estar vacío*\n\n*Ejemplo:*\n`/rechazar {$pagoId} Monto incorrecto`");
         return;
     }
     
-    // Validar que el ID sea válido
     if ($pagoId <= 0) {
         enviarMensaje($chatId, "❌ *ID de pago inválido*\n\n*Ejemplo:*\n`/rechazar 5 Monto incorrecto`");
         return;

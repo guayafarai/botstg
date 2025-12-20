@@ -2,7 +2,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  * SISTEMA COMPLETO DE PAGOS - BOT TELEGRAM IMEI
- * VERSIÓN CORREGIDA - FIX EN FUNCIÓN rechazarPago()
+ * VERSIÓN CON FIXES CRÍTICOS APLICADOS
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -185,9 +185,17 @@ class SistemaPagos {
     
     // ═══════════════════════════════════════
     // CREACIÓN DE SOLICITUD DE PAGO
+    // FIX CRÍTICO #4: Validar que el usuario existe
     // ═══════════════════════════════════════
     
     public function crearSolicitudPago($telegramId, $paqueteId, $metodoPago, $moneda) {
+        // FIX CRÍTICO #4: Verificar que el usuario existe antes de crear el pago
+        $usuario = $this->db->getUsuario($telegramId);
+        if (!$usuario) {
+            error_log("ERROR: Intento de crear pago para usuario inexistente: {$telegramId}");
+            return ['exito' => false, 'mensaje' => 'Usuario no encontrado. Usa /start primero.'];
+        }
+        
         $paquete = $this->obtenerPaquete($paqueteId);
         
         if (!$paquete) {
@@ -370,22 +378,11 @@ class SistemaPagos {
         }
     }
     
-    /**
-     * ═══════════════════════════════════════════════════════════════
-     * FUNCIÓN CORREGIDA: rechazarPago()
-     * ═══════════════════════════════════════════════════════════════
-     */
     public function rechazarPago($pagoId, $adminId, $motivo) {
         error_log("=== INICIANDO RECHAZO DE PAGO ===");
         error_log("Pago ID: {$pagoId}");
         error_log("Admin ID: {$adminId}");
         error_log("Motivo: {$motivo}");
-        
-        // Validar entrada
-        if (empty($motivo)) {
-            error_log("ERROR: Motivo vacío");
-            return ['exito' => false, 'mensaje' => 'El motivo no puede estar vacío'];
-        }
         
         // Obtener información del pago
         $sql = "SELECT * FROM pagos_pendientes WHERE id = :id";
@@ -557,7 +554,7 @@ class SistemaPagos {
     }
     
     // ═══════════════════════════════════════
-    // NOTIFICACIONES
+    // NOTIFICACIONES (CON FIX CRÍTICO #7)
     // ═══════════════════════════════════════
     
     private function notificarNuevaSolicitud($pagoId, $telegramId, $paquete, $precio, $moneda, $metodoPago) {
@@ -737,7 +734,7 @@ class SistemaPagos {
     }
     
     // ═══════════════════════════════════════
-    // FUNCIONES AUXILIARES
+    // FUNCIONES AUXILIARES (CON FIX CRÍTICO #7)
     // ═══════════════════════════════════════
     
     private function enviarMensaje($chatId, $texto, $parseMode = 'Markdown') {
@@ -758,7 +755,23 @@ class SistemaPagos {
         ];
         
         $context = stream_context_create($options);
-        return @file_get_contents($url, false, $context);
+        
+        // FIX CRÍTICO #7: No silenciar errores y validar respuesta
+        $response = file_get_contents($url, false, $context);
+        
+        if ($response === false) {
+            $error = error_get_last();
+            error_log("Error al enviar mensaje a chat {$chatId}: " . ($error['message'] ?? 'Unknown error'));
+            return false;
+        }
+        
+        $result = json_decode($response, true);
+        if (!isset($result['ok']) || !$result['ok']) {
+            error_log("Telegram API error para chat {$chatId}: " . ($result['description'] ?? 'Unknown error'));
+            return false;
+        }
+        
+        return $response;
     }
     
     private function enviarFoto($chatId, $fileId) {
@@ -778,7 +791,23 @@ class SistemaPagos {
         ];
         
         $context = stream_context_create($options);
-        return @file_get_contents($url, false, $context);
+        
+        // FIX CRÍTICO #7: No silenciar errores y validar respuesta
+        $response = file_get_contents($url, false, $context);
+        
+        if ($response === false) {
+            $error = error_get_last();
+            error_log("Error al enviar foto a chat {$chatId}: " . ($error['message'] ?? 'Unknown error'));
+            return false;
+        }
+        
+        $result = json_decode($response, true);
+        if (!isset($result['ok']) || !$result['ok']) {
+            error_log("Telegram API error (foto) para chat {$chatId}: " . ($result['description'] ?? 'Unknown error'));
+            return false;
+        }
+        
+        return $response;
     }
     
     public function obtenerDetallePago($pagoId) {

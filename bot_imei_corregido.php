@@ -2,7 +2,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  * BOT TELEGRAM - GENERADOR DE IMEI CON SISTEMA DE CRÉDITOS
- * VERSIÓN 2.0 - CON SISTEMA DE PAGOS COMPLETO
+ * VERSIÓN 2.1 - FIXES CRÍTICOS APLICADOS
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -494,7 +494,21 @@ function enviarMensaje($chatId, $texto, $parseMode = 'Markdown', $replyMarkup = 
     ];
     
     $context = stream_context_create($options);
-    return @file_get_contents($url, false, $context);
+    $response = @file_get_contents($url, false, $context);
+    
+    // FIX CRÍTICO #9: Validar respuesta de Telegram
+    if ($response === false) {
+        error_log("Error al enviar mensaje a chat {$chatId}");
+        return false;
+    }
+    
+    $result = json_decode($response, true);
+    if (!isset($result['ok']) || !$result['ok']) {
+        error_log("Telegram API error: " . ($result['description'] ?? 'Unknown error'));
+        return false;
+    }
+    
+    return $response;
 }
 
 function answerCallbackQuery($callbackQueryId, $texto = '', $showAlert = false) {
@@ -813,6 +827,9 @@ function procesarTAC($chatId, $texto, $telegramId, $db, $estados) {
     }
     
     enviarMensaje($chatId, $respuesta);
+    
+    // FIX CRÍTICO #6: Limpiar estado después de generar IMEI
+    $estados->limpiarEstado($chatId);
 }
 
 // ============================================
@@ -926,6 +943,17 @@ function procesarActualizacion($update, $db, $estados, $sistemaPagos) {
     // Procesar callback queries (botones inline)
     if (isset($update['callback_query'])) {
         $callbackQuery = $update['callback_query'];
+        
+        // FIX CRÍTICO #3: Validar que 'message' existe antes de acceder
+        if (!isset($callbackQuery['message'])) {
+            error_log("Callback query sin mensaje - probablemente un callback antiguo");
+            // Responder al callback para que no quede pendiente
+            if (isset($callbackQuery['id'])) {
+                answerCallbackQuery($callbackQuery['id'], 'Acción no disponible', true);
+            }
+            return;
+        }
+        
         $chatId = $callbackQuery['message']['chat']['id'];
         $telegramId = $callbackQuery['from']['id'];
         $data = $callbackQuery['data'];

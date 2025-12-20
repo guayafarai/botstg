@@ -1,7 +1,7 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * COMANDOS DE PAGOS - VERSIÓN FINAL CORREGIDA
+ * COMANDOS DE PAGOS - VERSIÓN CORREGIDA CON FIX DE ESTADO
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -119,14 +119,44 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
     
     $pagoId = $resultado['pago_id'];
     
-    // Actualizar estado a esperando_captura
+    error_log("=== PAGO CREADO ===");
+    error_log("Pago ID: {$pagoId}");
+    
+    // ══════════════════════════════════════════════════════════════════
+    // FIX CRÍTICO: Forzar el estado a 'esperando_captura' INMEDIATAMENTE
+    // ══════════════════════════════════════════════════════════════════
+    $sqlUpdate = "UPDATE pagos_pendientes 
+                  SET estado = 'esperando_captura' 
+                  WHERE id = :pago_id";
+    
     try {
-        $sql = "UPDATE pagos_pendientes SET estado = 'esperando_captura' WHERE id = :pago_id";
-        $stmt = $db->conn->prepare($sql);
-        $stmt->execute([':pago_id' => $pagoId]);
+        $stmt = $db->conn->prepare($sqlUpdate);
+        $resultado_update = $stmt->execute([':pago_id' => $pagoId]);
+        
+        error_log("UPDATE estado ejecutado - Resultado: " . ($resultado_update ? 'TRUE' : 'FALSE'));
+        error_log("Filas afectadas: " . $stmt->rowCount());
+        
+        // Verificar que se actualizó correctamente
+        $sqlVerify = "SELECT estado FROM pagos_pendientes WHERE id = :pago_id";
+        $stmtVerify = $db->conn->prepare($sqlVerify);
+        $stmtVerify->execute([':pago_id' => $pagoId]);
+        $estadoActual = $stmtVerify->fetch(PDO::FETCH_ASSOC);
+        
+        error_log("Estado después del UPDATE: '" . $estadoActual['estado'] . "'");
+        
+        if (empty($estadoActual['estado']) || $estadoActual['estado'] !== 'esperando_captura') {
+            error_log("ERROR CRÍTICO: Estado no se actualizó correctamente!");
+            
+            // Intentar actualización forzada alternativa
+            $db->conn->exec("UPDATE pagos_pendientes SET estado = 'esperando_captura' WHERE id = {$pagoId}");
+            
+            error_log("Actualización forzada ejecutada");
+        }
+        
     } catch(PDOException $e) {
-        error_log("Error al actualizar estado: " . $e->getMessage());
+        error_log("ERROR al actualizar estado: " . $e->getMessage());
     }
+    // ══════════════════════════════════════════════════════════════════
     
     // Actualizar estado del usuario
     $estados->setEstado($chatId, 'esperando_pago', [
@@ -260,6 +290,27 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         }
         
         error_log("Pago encontrado - Estado actual: '{$pago['estado']}'");
+        
+        // ══════════════════════════════════════════════════════════════
+        // FIX CRÍTICO: Si el estado está vacío, forzarlo ahora
+        // ══════════════════════════════════════════════════════════════
+        if (empty($pago['estado'])) {
+            error_log("ADVERTENCIA: Estado vacío detectado - FORZANDO a 'esperando_captura'");
+            
+            $sqlFix = "UPDATE pagos_pendientes SET estado = 'esperando_captura' WHERE id = :pago_id";
+            $stmtFix = $db->conn->prepare($sqlFix);
+            $stmtFix->execute([':pago_id' => $pagoId]);
+            
+            // Re-leer el pago
+            $stmt->execute([
+                ':pago_id' => $pagoId,
+                ':telegram_id' => $telegramId
+            ]);
+            $pago = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            error_log("Estado después del fix: '{$pago['estado']}'");
+        }
+        // ══════════════════════════════════════════════════════════════
         
         // VERIFICACIÓN CRÍTICA: ¿El pago ya fue procesado?
         $estadosFinales = ['aprobado', 'rechazado', 'captura_enviada'];

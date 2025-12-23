@@ -61,37 +61,75 @@ class Database {
     /**
      * Registrar o actualizar usuario
      */
-    public function registrarUsuario($telegramId, $username, $firstName, $lastName) {
-        $sql = "INSERT INTO usuarios (telegram_id, username, first_name, last_name, creditos)
-                VALUES (:telegram_id, :username, :first_name, :last_name, :creditos)
-                ON DUPLICATE KEY UPDATE 
-                    username = VALUES(username),
-                    first_name = VALUES(first_name),
-                    last_name = VALUES(last_name),
-                    ultima_actividad = CURRENT_TIMESTAMP";
-        
-        try {
-            $stmt = $this->conn->prepare($sql);
-            $creditos = CREDITOS_REGISTRO;
-            
-            $result = $stmt->execute([
-                ':telegram_id' => (int)$telegramId,
-                ':username' => $this->sanitize($username),
-                ':first_name' => $this->sanitize($firstName),
-                ':last_name' => $this->sanitize($lastName),
-                ':creditos' => (int)$creditos
+public function registrarUsuario($telegramId, $username, $firstName, $lastName)
+{
+    try {
+        // 1️⃣ Verificar si el usuario ya existe
+        $check = $this->conn->prepare("
+            SELECT id 
+            FROM usuarios 
+            WHERE telegram_id = ?
+            LIMIT 1
+        ");
+        $check->execute([(int)$telegramId]);
+
+        if ($check->fetch(PDO::FETCH_ASSOC)) {
+            // 🔁 Usuario existente → solo actualizar datos básicos
+            $update = $this->conn->prepare("
+                UPDATE usuarios 
+                SET username = ?, 
+                    first_name = ?, 
+                    last_name = ?, 
+                    ultima_actividad = CURRENT_TIMESTAMP
+                WHERE telegram_id = ?
+            ");
+
+            $update->execute([
+                $this->sanitize($username),
+                $this->sanitize($firstName),
+                $this->sanitize($lastName),
+                (int)$telegramId
             ]);
-            
-            if ($stmt->rowCount() > 0) {
-                $this->registrarTransaccion($telegramId, 'registro', $creditos, 'Créditos de bienvenida');
-                return true;
-            }
-            return false;
-        } catch(PDOException $e) {
-            logSecure("Error al registrar usuario {$telegramId}: " . $e->getMessage(), 'ERROR');
-            return false;
+
+            return false; // ❌ NO es nuevo
         }
+
+        // 2️⃣ Usuario nuevo → insertar + regalar créditos
+        $insert = $this->conn->prepare("
+            INSERT INTO usuarios 
+                (telegram_id, username, first_name, last_name, creditos)
+            VALUES (?, ?, ?, ?, ?)
+        ");
+
+        $creditos = (int)CREDITOS_REGISTRO;
+
+        $insert->execute([
+            (int)$telegramId,
+            $this->sanitize($username),
+            $this->sanitize($firstName),
+            $this->sanitize($lastName),
+            $creditos
+        ]);
+
+        // Registrar transacción SOLO una vez
+        $this->registrarTransaccion(
+            $telegramId,
+            'registro',
+            $creditos,
+            'Créditos de bienvenida'
+        );
+
+        return true; // ✅ Usuario nuevo
+
+    } catch (PDOException $e) {
+        logSecure(
+            "Error al registrar usuario {$telegramId}: " . $e->getMessage(),
+            'ERROR'
+        );
+        return false;
     }
+}
+
     
     /**
      * Obtener información de usuario

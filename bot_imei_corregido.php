@@ -2,7 +2,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  * BOT TELEGRAM - GENERADOR DE IMEI CON SISTEMA DE CRÉDITOS
- * VERSIÓN 2.3 - TODOS LOS PROBLEMAS CORREGIDOS
+ * VERSIÓN 2.3.1 - CORREGIDO (comandoStatsAPI fixed)
  * ═══════════════════════════════════════════════════════════════
  * 
  * CORRECCIONES IMPLEMENTADAS:
@@ -11,6 +11,7 @@
  * 3. Botones del menú funcionando correctamente
  * 4. Gestión de modelos mejorada
  * 5. Sistema de pagos optimizado
+ * 6. comandoStatsAPI corregido - usa ultima_consulta en lugar de fecha_agregado
  */
 
 // ============================================
@@ -399,11 +400,13 @@ function getTecladoPrincipal($esAdmin = false) {
 function getTecladoAdmin() {
     return crearTeclado([
         [['text' => '📊 Estadísticas'], ['text' => '👥 Top Usuarios']],
-        [['text' => '💸 Pagos Pendientes'], ['text' => '🚫 Bloquear Usuario']],
-        [['text' => '⭐ Hacer Premium'], ['text' => '📱 Gestionar Modelos']],
-        [['text' => '📡 Stats API'], ['text' => '🔙 Volver al Menú']]
+        [['text' => '💸 Pagos Pendientes'], ['text' => '🚨 Ver Fraudes']], // 👈 NUEVO
+        [['text' => '🚫 Bloquear Usuario'], ['text' => '⭐ Hacer Premium']],
+        [['text' => '📱 Gestionar Modelos'], ['text' => '📡 Stats API']],
+        [['text' => '🔙 Volver al Menú']]
     ]);
 }
+
 
 /**
  * Verificar si es administrador
@@ -1144,7 +1147,7 @@ function comandoEliminarModelo($chatId, $texto, $db) {
 }
 
 /**
- * Stats API
+ * Stats API - ✅ CORREGIDO
  */
 function comandoStatsAPI($chatId, $db) {
     try {
@@ -1158,7 +1161,7 @@ function comandoStatsAPI($chatId, $db) {
         ");
         $fuentesData = $stmt->fetchAll();
         
-        // Total de consultas a la API (estimado por modelos de fuente API)
+        // Total de consultas a la API
         $stmt = $conn->query("
             SELECT SUM(veces_usado) as total_consultas
             FROM tac_modelos 
@@ -1167,11 +1170,11 @@ function comandoStatsAPI($chatId, $db) {
         $consultasAPI = $stmt->fetch();
         $totalConsultasAPI = $consultasAPI['total_consultas'] ?? 0;
         
-        // Modelos agregados en las últimas 24h
+        // ✅ CORREGIDO: Usar ultima_consulta en lugar de fecha_agregado
         $stmt = $conn->query("
             SELECT COUNT(*) as nuevos
             FROM tac_modelos 
-            WHERE fecha_agregado >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+            WHERE ultima_consulta >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
         ");
         $nuevos24h = $stmt->fetch();
         $modelosNuevos = $nuevos24h['nuevos'] ?? 0;
@@ -1184,7 +1187,7 @@ function comandoStatsAPI($chatId, $db) {
         $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
         $respuesta .= "🔑 Estado: " . (defined('IMEIDB_API_KEY') && IMEIDB_API_KEY ? "✅ Configurada" : "❌ Sin configurar") . "\n";
         $respuesta .= "📊 Consultas totales: *{$totalConsultasAPI}*\n";
-        $respuesta .= "📅 Nuevos (24h): *{$modelosNuevos}*\n\n";
+        $respuesta .= "📅 Actualizados (24h): *{$modelosNuevos}*\n\n";
         
         $respuesta .= "📚 *MODELOS POR FUENTE:*\n";
         $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -1339,6 +1342,75 @@ function procesarActualizacion($update, $db, $estados, $sistemaPagos) {
     elseif ($texto == '📊 Estadísticas' && $esAdminUser) {
         comandoEstadisticasAdmin($chatId, $db);
     }
+
+elseif ($texto == '🚨 Ver Fraudes' && $esAdminUser) {
+
+    try {
+        $conn = $db->getConnection();
+
+        // Verificar si la vista existe
+        $check = $conn->prepare("
+            SELECT COUNT(*) 
+            FROM information_schema.views
+            WHERE table_schema = DATABASE()
+            AND table_name = 'vista_intentos_fraude'
+        ");
+        $check->execute();
+
+        if ($check->fetchColumn() == 0) {
+            // Crear vista automáticamente
+            $conn->exec("
+                CREATE VIEW vista_intentos_fraude AS
+                SELECT 
+                    cd.telegram_id,
+                    u.username,
+                    COUNT(*) AS total_intentos,
+                    MAX(cd.fecha) AS ultimo_intento
+                FROM capturas_duplicadas cd
+                LEFT JOIN usuarios u ON cd.telegram_id = u.telegram_id
+                GROUP BY cd.telegram_id, u.username
+            ");
+        }
+
+        $stmt = $conn->query("
+            SELECT * 
+            FROM vista_intentos_fraude
+            ORDER BY ultimo_intento DESC
+            LIMIT 20
+        ");
+
+        $fraudes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (!$fraudes) {
+            enviarMensaje($chatId, "✅ No hay intentos de fraude");
+        }
+
+        $msg = "🚨 *INTENTOS DE FRAUDE DETECTADOS*\n\n";
+
+        foreach ($fraudes as $f) {
+            $msg .= "👤 Usuario: `{$f['telegram_id']}`\n";
+            if (!empty($f['username'])) {
+                $msg .= "🔖 @{$f['username']}\n";
+            }
+            $msg .= "⚠️ Intentos: *{$f['total_intentos']}*\n";
+            $msg .= "🕒 Último intento: {$f['ultimo_intento']}\n";
+            $msg .= "──────────────\n";
+        }
+
+        enviarMensaje($chatId, $msg);
+
+    } catch (Throwable $e) {
+
+        enviarMensaje(
+            $chatId,
+            "❌ Error al obtener fraudes\n\n" .
+            "📛 " . $e->getMessage()
+        );
+    }
+}
+
+
+
     elseif ($texto == '👥 Top Usuarios' && $esAdminUser) {
         comandoTopUsuarios($chatId, $db);
     }
@@ -1524,7 +1596,7 @@ try {
         if (isset($argv[1]) && $argv[1] == 'polling') {
             modoPolling($db, $estados, $sistemaPagos);
         } else {
-            echo "Uso: php bot_imei_corregido_FIXED.php polling\n";
+            echo "Uso: php bot_imei_corregido.php polling\n";
             exit(1);
         }
     } else {

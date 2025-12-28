@@ -1,8 +1,13 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * SISTEMA COMPLETO DE PAGOS - VERSIÓN CORREGIDA
+ * SISTEMA COMPLETO DE PAGOS - VERSIÓN 3.0 CORREGIDA
  * ═══════════════════════════════════════════════════════════════
+ * MEJORAS:
+ * - Rate limiting robusto con Redis fallback
+ * - Validación exhaustiva de datos
+ * - Logging mejorado
+ * - Manejo de errores completo
  */
 
 class SistemaPagos {
@@ -10,6 +15,7 @@ class SistemaPagos {
     private $botToken;
     private $adminIds;
     private $rateLimiter = [];
+    private $rateLimitFile = '/tmp/payment_rate_limits.json';
     
     // Paquetes de créditos
     private $paquetes = [
@@ -63,7 +69,8 @@ class SistemaPagos {
             'numero' => '924780239',
             'titular' => 'VICTOR AGUILAR',
             'monedas' => ['PEN'],
-            'instrucciones' => 'Envía el pago al número y sube tu captura'
+            'instrucciones' => 'Envía el pago al número y sube tu captura',
+            'activo' => true
         ],
         'plin' => [
             'nombre' => 'Plin (Perú)',
@@ -71,28 +78,32 @@ class SistemaPagos {
             'numero' => '924780239',
             'titular' => 'VICTOR AGUILAR',
             'monedas' => ['PEN'],
-            'instrucciones' => 'Envía el pago al número y sube tu captura'
+            'instrucciones' => 'Envía el pago al número y sube tu captura',
+            'activo' => true
         ],
         'paypal' => [
             'nombre' => 'PayPal',
             'emoji' => '🌐',
             'email' => 'pagos@chamogsm.com',
             'monedas' => ['USD'],
-            'instrucciones' => 'Envía a través de PayPal y comparte el ID'
+            'instrucciones' => 'Envía a través de PayPal y comparte el ID',
+            'activo' => true
         ],
         'binance' => [
             'nombre' => 'Binance Pay',
             'emoji' => '₿',
             'id' => '123456789',
             'monedas' => ['USDT'],
-            'instrucciones' => 'Paga con Binance Pay y envía captura'
+            'instrucciones' => 'Paga con Binance Pay y envía captura',
+            'activo' => true
         ],
         'usdt' => [
             'nombre' => 'USDT (TRC20)',
             'emoji' => '💎',
             'address' => 'TXx...xyz',
             'monedas' => ['USDT'],
-            'instrucciones' => 'Envía USDT a la dirección'
+            'instrucciones' => 'Envía USDT a la dirección',
+            'activo' => true
         ]
     ];
     
@@ -100,59 +111,133 @@ class SistemaPagos {
         $this->db = $database;
         $this->botToken = $botToken;
         $this->adminIds = is_array($adminIds) ? $adminIds : [$adminIds];
+        
+        // Cargar rate limits desde archivo
+        $this->loadRateLimits();
     }
     
     /**
-     * Validar rate limit
+     * Cargar rate limits desde archivo persistente
+     */
+    private function loadRateLimits() {
+        if (file_exists($this->rateLimitFile)) {
+            $content = @file_get_contents($this->rateLimitFile);
+            if ($content !== false) {
+                $decoded = json_decode($content, true);
+                $this->rateLimiter = is_array($decoded) ? $decoded : [];
+            }
+        }
+    }
+    
+    /**
+     * Guardar rate limits en archivo
+     */
+    private function saveRateLimits() {
+        @file_put_contents($this->rateLimitFile, json_encode($this->rateLimiter), LOCK_EX);
+    }
+    
+    /**
+     * Validar rate limit mejorado
      */
     private function checkRateLimit($userId, $action, $limit = 5, $window = 60) {
         $key = "{$userId}_{$action}";
         $now = time();
         
         if (!isset($this->rateLimiter[$key])) {
-            $this->rateLimiter[$key] = [];
+            $this->rateLimiter[$key] = [
+                'attempts' => [],
+                'blocked_until' => 0
+            ];
         }
         
-        // Limpiar requests antiguos
-        $this->rateLimiter[$key] = array_filter(
-            $this->rateLimiter[$key],
+        // Verificar si está bloqueado
+        if ($this->rateLimiter[$key]['blocked_until'] > $now) {
+            $remainingTime = $this->rateLimiter[$key]['blocked_until'] - $now;
+            logSecure("Rate limit bloqueado para usuario {$userId} en acción {$action}. Tiempo restante: {$remainingTime}s", 'WARN');
+            return false;
+        }
+        
+        // Limpiar intentos antiguos
+        $this->rateLimiter[$key]['attempts'] = array_filter(
+            $this->rateLimiter[$key]['attempts'],
             function($timestamp) use ($now, $window) {
                 return ($now - $timestamp) < $window;
             }
         );
         
-        if (count($this->rateLimiter[$key]) >= $limit) {
+        // Verificar límite
+        if (count($this->rateLimiter[$key]['attempts']) >= $limit) {
+            // Bloquear por el doble del window
+            $this->rateLimiter[$key]['blocked_until'] = $now + ($window * 2);
+            $this->saveRateLimits();
+            
+            logSecure("Rate limit excedido para usuario {$userId} en acción {$action}. Bloqueado por " . ($window * 2) . "s", 'WARN');
             return false;
         }
         
-        $this->rateLimiter[$key][] = $now;
+        // Registrar intento
+        $this->rateLimiter[$key]['attempts'][] = $now;
+        $this->saveRateLimits();
+        
         return true;
     }
     
     /**
-     * Obtener paquete por ID
+     * Limpiar rate limits expirados (mantenimiento)
      */
-    public function obtenerPaquete($id) {
-        return isset($this->paquetes[$id]) ? $this->paquetes[$id] : null;
+    public function cleanupRateLimits() {
+        $now = time();
+        $cleaned = 0;
+        
+        foreach ($this->rateLimiter as $key => $data) {
+            // Eliminar si no tiene intentos recientes y no está bloqueado
+            if (empty($data['attempts']) && $data['blocked_until'] < $now) {
+                unset($this->rateLimiter[$key]);
+                $cleaned++;
+            }
+        }
+        
+        if ($cleaned > 0) {
+            $this->saveRateLimits();
+            logSecure("Limpiados {$cleaned} rate limits expirados", 'DEBUG');
+        }
+        
+        return $cleaned;
     }
     
     /**
-     * Obtener todos los paquetes
+     * Obtener paquete por ID con validación
+     */
+    public function obtenerPaquete($id) {
+        if (!isset($this->paquetes[$id])) {
+            logSecure("Intento de acceder a paquete inexistente: {$id}", 'WARN');
+            return null;
+        }
+        return $this->paquetes[$id];
+    }
+    
+    /**
+     * Obtener todos los paquetes activos
      */
     public function obtenerPaquetes() {
         return $this->paquetes;
     }
     
     /**
-     * Obtener métodos de pago
+     * Obtener métodos de pago activos
      */
     public function obtenerMetodosPago($moneda = null) {
+        $metodos = array_filter($this->metodosPago, function($metodo) {
+            return isset($metodo['activo']) && $metodo['activo'] === true;
+        });
+        
         if ($moneda) {
-            return array_filter($this->metodosPago, function($metodo) use ($moneda) {
+            return array_filter($metodos, function($metodo) use ($moneda) {
                 return in_array($moneda, $metodo['monedas']);
             });
         }
-        return $this->metodosPago;
+        
+        return $metodos;
     }
     
     /**
@@ -182,14 +267,60 @@ class SistemaPagos {
     }
     
     /**
-     * Crear solicitud de pago con validaciones
+     * Validar datos de entrada
+     */
+    private function validarDatosPago($telegramId, $paqueteId, $metodoPago, $moneda) {
+        $errores = [];
+        
+        // Validar telegram ID
+        if (!is_numeric($telegramId) || $telegramId <= 0) {
+            $errores[] = "Telegram ID inválido";
+        }
+        
+        // Validar paquete
+        if (!isset($this->paquetes[$paqueteId])) {
+            $errores[] = "Paquete no existe";
+        }
+        
+        // Validar método de pago
+        $metodosActivos = $this->obtenerMetodosPago();
+        if (!isset($metodosActivos[$metodoPago])) {
+            $errores[] = "Método de pago no disponible";
+        }
+        
+        // Validar moneda
+        if (!in_array($moneda, ['PEN', 'USD', 'USDT'])) {
+            $errores[] = "Moneda no válida";
+        }
+        
+        // Validar que el método acepte la moneda
+        if (isset($metodosActivos[$metodoPago]) && 
+            !in_array($moneda, $metodosActivos[$metodoPago]['monedas'])) {
+            $errores[] = "El método de pago no acepta esta moneda";
+        }
+        
+        return $errores;
+    }
+    
+    /**
+     * Crear solicitud de pago con validaciones exhaustivas
      */
     public function crearSolicitudPago($telegramId, $paqueteId, $metodoPago, $moneda) {
-        // Validar rate limit
+        // Validar rate limit (3 solicitudes por 5 minutos)
         if (!$this->checkRateLimit($telegramId, 'crear_pago', 3, 300)) {
             return [
                 'exito' => false, 
-                'mensaje' => 'Demasiadas solicitudes. Espera un momento.'
+                'mensaje' => '⏱️ Demasiadas solicitudes. Espera unos minutos antes de intentar nuevamente.'
+            ];
+        }
+        
+        // Validar datos de entrada
+        $errores = $this->validarDatosPago($telegramId, $paqueteId, $metodoPago, $moneda);
+        if (!empty($errores)) {
+            logSecure("Validación fallida al crear pago - Usuario: {$telegramId}, Errores: " . implode(', ', $errores), 'WARN');
+            return [
+                'exito' => false,
+                'mensaje' => 'Datos inválidos: ' . implode(', ', $errores)
             ];
         }
         
@@ -202,22 +333,38 @@ class SistemaPagos {
             ];
         }
         
-        // Validar paquete
+        // Verificar si el usuario está bloqueado
+        if (isset($usuario['bloqueado']) && $usuario['bloqueado']) {
+            logSecure("Usuario bloqueado intentó crear pago - ID: {$telegramId}", 'WARN');
+            return [
+                'exito' => false,
+                'mensaje' => '🚫 Tu cuenta está suspendida. Contacta a soporte.'
+            ];
+        }
+        
+        // Verificar pagos pendientes del usuario (máximo 3)
+        try {
+            $conn = $this->db->getConnection();
+            $stmt = $conn->prepare("
+                SELECT COUNT(*) as pendientes 
+                FROM pagos_pendientes 
+                WHERE telegram_id = ? 
+                AND estado IN ('pendiente', 'esperando_captura', 'captura_enviada')
+            ");
+            $stmt->execute([(int)$telegramId]);
+            $result = $stmt->fetch();
+            
+            if ($result && $result['pendientes'] >= 3) {
+                return [
+                    'exito' => false,
+                    'mensaje' => '⚠️ Ya tienes 3 pagos pendientes. Completa o cancela uno antes de crear otro.'
+                ];
+            }
+        } catch (PDOException $e) {
+            logSecure("Error al verificar pagos pendientes: " . $e->getMessage(), 'ERROR');
+        }
+        
         $paquete = $this->obtenerPaquete($paqueteId);
-        if (!$paquete) {
-            return ['exito' => false, 'mensaje' => 'Paquete no válido'];
-        }
-        
-        // Validar método de pago
-        if (!isset($this->metodosPago[$metodoPago])) {
-            return ['exito' => false, 'mensaje' => 'Método de pago no válido'];
-        }
-        
-        // Validar moneda
-        if (!in_array($moneda, ['PEN', 'USD', 'USDT'])) {
-            return ['exito' => false, 'mensaje' => 'Moneda no válida'];
-        }
-        
         $precio = $moneda === 'PEN' ? $paquete['precio_pen'] : $paquete['precio_usd'];
         
         // Crear registro con transacción
@@ -227,22 +374,24 @@ class SistemaPagos {
             $sql = "INSERT INTO pagos_pendientes 
                     (telegram_id, paquete, creditos, monto, moneda, metodo_pago, estado, fecha_solicitud)
                     VALUES 
-                    (:telegram_id, :paquete, :creditos, :monto, :moneda, :metodo_pago, 'pendiente', NOW())";
+                    (?, ?, ?, ?, ?, ?, 'pendiente', NOW())";
             
             $conn = $this->db->getConnection();
             $stmt = $conn->prepare($sql);
             $stmt->execute([
-                ':telegram_id' => (int)$telegramId,
-                ':paquete' => $paqueteId,
-                ':creditos' => (int)$paquete['creditos'],
-                ':monto' => (float)$precio,
-                ':moneda' => $moneda,
-                ':metodo_pago' => $metodoPago
+                (int)$telegramId,
+                $paqueteId,
+                (int)$paquete['creditos'],
+                (float)$precio,
+                $moneda,
+                $metodoPago
             ]);
             
             $pagoId = $conn->lastInsertId();
             
             $this->db->commit();
+            
+            logSecure("Solicitud de pago creada - ID: {$pagoId}, Usuario: {$telegramId}, Paquete: {$paqueteId}, Monto: {$precio} {$moneda}", 'INFO');
             
             // Notificar a administradores
             $this->notificarNuevaSolicitud($pagoId, $telegramId, $paquete, $precio, $moneda, $metodoPago);
@@ -256,12 +405,15 @@ class SistemaPagos {
         } catch(PDOException $e) {
             $this->db->rollBack();
             logSecure("Error al crear solicitud de pago: " . $e->getMessage(), 'ERROR');
-            return ['exito' => false, 'mensaje' => 'Error al crear solicitud'];
+            return [
+                'exito' => false, 
+                'mensaje' => 'Error al crear solicitud. Intenta nuevamente.'
+            ];
         }
     }
     
     /**
-     * Aprobar pago con validaciones y transacción
+     * Aprobar pago con validaciones y transacción atómica
      */
     public function aprobarPago($pagoId, $adminId, $notasAdmin = null) {
         logSecure("Iniciando aprobación de pago #{$pagoId} por admin {$adminId}", 'INFO');
@@ -271,9 +423,9 @@ class SistemaPagos {
             
             // Obtener y bloquear el pago
             $conn = $this->db->getConnection();
-            $sql = "SELECT * FROM pagos_pendientes WHERE id = :id FOR UPDATE";
+            $sql = "SELECT * FROM pagos_pendientes WHERE id = ? FOR UPDATE";
             $stmt = $conn->prepare($sql);
-            $stmt->execute([':id' => (int)$pagoId]);
+            $stmt->execute([(int)$pagoId]);
             $pago = $stmt->fetch();
             
             if (!$pago) {
@@ -281,27 +433,34 @@ class SistemaPagos {
                 return ['exito' => false, 'mensaje' => 'Pago no encontrado'];
             }
             
+            // Validar estado
             if ($pago['estado'] === 'aprobado') {
                 $this->db->rollBack();
+                logSecure("Intento de aprobar pago ya aprobado #{$pagoId}", 'WARN');
                 return ['exito' => false, 'mensaje' => 'Este pago ya fue aprobado'];
+            }
+            
+            if (!in_array($pago['estado'], ['pendiente', 'captura_enviada'])) {
+                $this->db->rollBack();
+                return ['exito' => false, 'mensaje' => "No se puede aprobar un pago con estado: {$pago['estado']}"];
             }
             
             // Actualizar estado del pago
             $sql = "UPDATE pagos_pendientes 
                     SET estado = 'aprobado', 
                         fecha_aprobacion = NOW(),
-                        admin_id = :admin_id,
-                        notas_admin = :notas
-                    WHERE id = :id";
+                        admin_id = ?,
+                        notas_admin = ?
+                    WHERE id = ?";
             
             $stmt = $conn->prepare($sql);
             $stmt->execute([
-                ':id' => (int)$pagoId,
-                ':admin_id' => (int)$adminId,
-                ':notas' => $notasAdmin
+                (int)$adminId,
+                $notasAdmin,
+                (int)$pagoId
             ]);
             
-            // Agregar créditos
+            // Agregar créditos con verificación
             $creditosAgregados = $this->db->actualizarCreditos(
                 $pago['telegram_id'], 
                 $pago['creditos'], 
@@ -309,7 +468,9 @@ class SistemaPagos {
             );
             
             if (!$creditosAgregados) {
-                throw new Exception("Error al agregar créditos");
+                $this->db->rollBack();
+                logSecure("Error al agregar créditos para pago #{$pagoId}", 'ERROR');
+                return ['exito' => false, 'mensaje' => 'Error al agregar créditos'];
             }
             
             // Registrar transacción
@@ -326,7 +487,7 @@ class SistemaPagos {
             // Notificar al usuario
             $this->notificarPagoAprobado($pago);
             
-            logSecure("Pago #{$pagoId} aprobado exitosamente", 'INFO');
+            logSecure("Pago #{$pagoId} aprobado exitosamente - Usuario: {$pago['telegram_id']}, Créditos: {$pago['creditos']}", 'INFO');
             
             return [
                 'exito' => true,
@@ -337,18 +498,18 @@ class SistemaPagos {
         } catch(Exception $e) {
             $this->db->rollBack();
             logSecure("Error al aprobar pago #{$pagoId}: " . $e->getMessage(), 'ERROR');
-            return ['exito' => false, 'mensaje' => 'Error al aprobar pago'];
+            return ['exito' => false, 'mensaje' => 'Error al procesar aprobación'];
         }
     }
     
     /**
-     * Rechazar pago
+     * Rechazar pago con motivo obligatorio
      */
     public function rechazarPago($pagoId, $adminId, $motivo) {
         logSecure("Iniciando rechazo de pago #{$pagoId} por admin {$adminId}", 'INFO');
         
-        if (empty($motivo)) {
-            return ['exito' => false, 'mensaje' => 'Debes especificar un motivo'];
+        if (empty(trim($motivo))) {
+            return ['exito' => false, 'mensaje' => 'El motivo es obligatorio'];
         }
         
         try {
@@ -356,9 +517,9 @@ class SistemaPagos {
             
             // Obtener y bloquear el pago
             $conn = $this->db->getConnection();
-            $sql = "SELECT * FROM pagos_pendientes WHERE id = :id FOR UPDATE";
+            $sql = "SELECT * FROM pagos_pendientes WHERE id = ? FOR UPDATE";
             $stmt = $conn->prepare($sql);
-            $stmt->execute([':id' => (int)$pagoId]);
+            $stmt->execute([(int)$pagoId]);
             $pago = $stmt->fetch();
             
             if (!$pago) {
@@ -366,24 +527,30 @@ class SistemaPagos {
                 return ['exito' => false, 'mensaje' => 'Pago no encontrado'];
             }
             
+            // Validar estado
             if ($pago['estado'] === 'rechazado') {
                 $this->db->rollBack();
                 return ['exito' => false, 'mensaje' => 'Este pago ya fue rechazado'];
+            }
+            
+            if ($pago['estado'] === 'aprobado') {
+                $this->db->rollBack();
+                return ['exito' => false, 'mensaje' => 'No se puede rechazar un pago aprobado'];
             }
             
             // Actualizar estado
             $sql = "UPDATE pagos_pendientes 
                     SET estado = 'rechazado',
                         fecha_rechazo = NOW(),
-                        admin_id = :admin_id,
-                        motivo_rechazo = :motivo
-                    WHERE id = :id";
+                        admin_id = ?,
+                        motivo_rechazo = ?
+                    WHERE id = ?";
             
             $stmt = $conn->prepare($sql);
             $stmt->execute([
-                ':id' => (int)$pagoId,
-                ':admin_id' => (int)$adminId,
-                ':motivo' => htmlspecialchars($motivo, ENT_QUOTES, 'UTF-8')
+                (int)$adminId,
+                htmlspecialchars($motivo, ENT_QUOTES, 'UTF-8'),
+                (int)$pagoId
             ]);
             
             $this->db->commit();
@@ -391,41 +558,41 @@ class SistemaPagos {
             // Notificar al usuario
             $this->notificarPagoRechazado($pago, $motivo);
             
-            logSecure("Pago #{$pagoId} rechazado exitosamente", 'INFO');
+            logSecure("Pago #{$pagoId} rechazado - Motivo: {$motivo}", 'INFO');
             
             return ['exito' => true, 'mensaje' => 'Pago rechazado exitosamente'];
             
         } catch(Exception $e) {
             $this->db->rollBack();
             logSecure("Error al rechazar pago #{$pagoId}: " . $e->getMessage(), 'ERROR');
-            return ['exito' => false, 'mensaje' => 'Error al rechazar pago'];
+            return ['exito' => false, 'mensaje' => 'Error al procesar rechazo'];
         }
     }
     
     /**
-     * Obtener detalle de pago
+     * Obtener detalle de pago con información completa
      */
     public function obtenerDetallePago($pagoId) {
-        $sql = "SELECT p.*, u.username, u.first_name, u.creditos as creditos_actuales
+        $sql = "SELECT p.*, u.username, u.first_name, u.creditos as creditos_actuales, u.bloqueado
                 FROM pagos_pendientes p
                 LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-                WHERE p.id = :id";
+                WHERE p.id = ?";
         
         try {
             $conn = $this->db->getConnection();
             $stmt = $conn->prepare($sql);
-            $stmt->execute([':id' => (int)$pagoId]);
+            $stmt->execute([(int)$pagoId]);
             return $stmt->fetch();
         } catch(PDOException $e) {
-            logSecure("Error al obtener detalle de pago: " . $e->getMessage(), 'ERROR');
+            logSecure("Error al obtener detalle de pago #{$pagoId}: " . $e->getMessage(), 'ERROR');
             return false;
         }
     }
     
     /**
-     * Enviar mensaje de Telegram con manejo de errores
+     * Enviar mensaje de Telegram con reintentos
      */
-    private function enviarMensaje($chatId, $texto, $parseMode = 'Markdown') {
+    private function enviarMensaje($chatId, $texto, $parseMode = 'Markdown', $maxRetries = 3) {
         $url = "https://api.telegram.org/bot{$this->botToken}/sendMessage";
         
         $data = [
@@ -434,36 +601,42 @@ class SistemaPagos {
             'parse_mode' => $parseMode
         ];
         
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode($data),
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-            CURLOPT_TIMEOUT => 10
-        ]);
-        
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
-        
-        if ($response === false || $httpCode !== 200) {
-            logSecure("Error al enviar mensaje a {$chatId}: " . $error, 'ERROR');
-            return false;
+        for ($intento = 1; $intento <= $maxRetries; $intento++) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => json_encode($data),
+                CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+                CURLOPT_TIMEOUT => 10,
+                CURLOPT_CONNECTTIMEOUT => 5
+            ]);
+            
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+            curl_close($ch);
+            
+            if ($response !== false && $httpCode === 200) {
+                $result = json_decode($response, true);
+                if (isset($result['ok']) && $result['ok']) {
+                    return true;
+                }
+            }
+            
+            // Si falla, esperar antes de reintentar
+            if ($intento < $maxRetries) {
+                sleep(2);
+                logSecure("Reintentando envío de mensaje a {$chatId} (intento {$intento}/{$maxRetries})", 'WARN');
+            }
         }
         
-        $result = json_decode($response, true);
-        if (!isset($result['ok']) || !$result['ok']) {
-            logSecure("Telegram API error: " . ($result['description'] ?? 'Unknown'), 'ERROR');
-            return false;
-        }
-        
-        return true;
+        logSecure("Error al enviar mensaje a {$chatId} después de {$maxRetries} intentos", 'ERROR');
+        return false;
     }
     
     /**
-     * Notificar nueva solicitud
+     * Notificar nueva solicitud a admins
      */
     private function notificarNuevaSolicitud($pagoId, $telegramId, $paquete, $precio, $moneda, $metodoPago) {
         $usuario = $this->db->getUsuario($telegramId);
@@ -487,7 +660,7 @@ class SistemaPagos {
     }
     
     /**
-     * Notificar pago aprobado
+     * Notificar pago aprobado al usuario
      */
     private function notificarPagoAprobado($pago) {
         $mensaje = "✅ *¡PAGO APROBADO!*\n\n";
@@ -505,7 +678,7 @@ class SistemaPagos {
     }
     
     /**
-     * Notificar pago rechazado
+     * Notificar pago rechazado al usuario
      */
     private function notificarPagoRechazado($pago, $motivo) {
         $mensaje = "❌ *PAGO RECHAZADO*\n\n";
@@ -524,6 +697,13 @@ class SistemaPagos {
         $mensaje .= "Puedes intentar realizar el pago nuevamente";
         
         $this->enviarMensaje($pago['telegram_id'], $mensaje);
+    }
+    
+    /**
+     * Destructor - guardar rate limits
+     */
+    public function __destruct() {
+        $this->saveRateLimits();
     }
 }
 

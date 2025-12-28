@@ -1,13 +1,13 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * COMANDOS DE PAGOS - VERSIÓN TOTALMENTE CORREGIDA v2.0
+ * COMANDOS DE PAGOS - VERSIÓN 3.0 ANTI-FRAUDE COMPLETA
  * ═══════════════════════════════════════════════════════════════
- * CAMBIOS:
- * - Funciones anti-fraude implementadas
- * - Validación robusta de capturas duplicadas
- * - Trigger de BD para prevenir race conditions
- * - Notificaciones mejoradas
+ * MEJORAS:
+ * - Detección de capturas duplicadas con constraint DB
+ * - Bloqueo automático de usuarios sospechosos
+ * - Validación exhaustiva de file_id
+ * - Logging detallado de intentos de fraude
  */
 
 require_once(__DIR__ . '/sistema_pagos.php');
@@ -16,6 +16,14 @@ require_once(__DIR__ . '/sistema_pagos.php');
  * Comando para mostrar paquetes y comprar créditos
  */
 function comandoComprarCreditosMejorado($chatId, $telegramId, $db, $sistemaPagos, $estados) {
+    // Verificar si el usuario está bloqueado
+    $usuario = $db->getUsuario($telegramId);
+    
+    if ($usuario && isset($usuario['bloqueado']) && $usuario['bloqueado']) {
+        enviarMensaje($chatId, "🚫 *CUENTA SUSPENDIDA*\n\nTu cuenta ha sido suspendida.\nContacta a @CHAMOGSM para más información.");
+        return;
+    }
+    
     $respuesta = "╔═══════════════════════════╗\n";
     $respuesta .= "║  💰 COMPRAR CRÉDITOS 💰   ║\n";
     $respuesta .= "╚═══════════════════════════╝\n\n";
@@ -62,6 +70,7 @@ function procesarSeleccionPaquete($chatId, $telegramId, $paqueteId, $db, $sistem
         return;
     }
     
+    // Guardar estado
     $estados->setEstado($chatId, 'seleccionando_metodo_pago', [
         'paquete_id' => $paqueteId,
         'paso' => 'metodo_pago'
@@ -219,21 +228,38 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
     }
     
     $respuesta .= "\n━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    $respuesta .= "📸 *IMPORTANTE*\n";
+    $respuesta .= "📸 *IMPORTANTE - LEE CON ATENCIÓN*\n";
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
     
-    $respuesta .= "• Envía el monto exacto\n";
-    $respuesta .= "• Incluye tu ID: `{$telegramId}`\n";
-    $respuesta .= "• Captura debe ser legible\n";
-    $respuesta .= "• ⚠️ No reutilices capturas antiguas\n\n";
+    $respuesta .= "✅ *HACER:*\n";
+    $respuesta .= "• Envía el monto exacto: ";
+    if ($moneda === 'PEN') {
+        $respuesta .= "S/. {$precio}\n";
+    } else {
+        $respuesta .= "\${$precio}\n";
+    }
+    $respuesta .= "• Incluye tu ID en el mensaje: `{$telegramId}`\n";
+    $respuesta .= "• Toma captura NUEVA de tu transacción\n";
+    $respuesta .= "• Envía la captura aquí\n\n";
+    
+    $respuesta .= "❌ *NO HACER:*\n";
+    $respuesta .= "• ⚠️ NO reutilizar capturas antiguas\n";
+    $respuesta .= "• ⚠️ NO usar capturas de otros pagos\n";
+    $respuesta .= "• ⚠️ NO enviar capturas borrosas\n\n";
+    
+    $respuesta .= "🚨 *SISTEMA ANTI-FRAUDE ACTIVO*\n";
+    $respuesta .= "Cada captura es validada automáticamente.\n";
+    $respuesta .= "Capturas duplicadas resultan en suspensión.\n\n";
     
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
     $respuesta .= "📸 *SIGUIENTE PASO*\n";
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
     
-    $respuesta .= "📸 *Envía tu captura como imagen*\n\n";
+    $respuesta .= "1️⃣ Realiza el pago AHORA\n";
+    $respuesta .= "2️⃣ Toma captura de la confirmación\n";
+    $respuesta .= "3️⃣ Envía la imagen aquí\n\n";
     
-    $respuesta .= "⏰ Tienes 72 horas";
+    $respuesta .= "⏰ Tienes 72 horas para completar";
     
     $keyboard = [
         'inline_keyboard' => [
@@ -247,7 +273,7 @@ function procesarSeleccionMetodoPago($chatId, $telegramId, $metodo, $moneda, $db
 }
 
 /**
- * Procesar captura de pago - VERSIÓN CORREGIDA CON ANTI-FRAUDE
+ * Procesar captura de pago - VERSIÓN FINAL ANTI-FRAUDE
  */
 function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos, $estados) {
     $estado = $estados->getEstado($chatId);
@@ -344,19 +370,26 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         return true;
     }
     
-    // Validar file_id (básico)
+    // Validar file_id
     if (strlen($fileId) < 10 || strlen($fileId) > 200) {
         logSecure("File ID inválido: longitud " . strlen($fileId), 'ERROR');
         enviarMensaje($chatId, "❌ Error: Imagen inválida. Intenta de nuevo");
         return true;
     }
     
+    // Validar que no sea un file_id sospechoso (todos caracteres iguales, etc)
+    if (preg_match('/^(.)\1+$/', $fileId)) {
+        logSecure("File ID sospechoso detectado: {$fileId}", 'WARN');
+        enviarMensaje($chatId, "❌ Error: Imagen inválida. Intenta de nuevo");
+        return true;
+    }
+    
     // ═══════════════════════════════════════════════════════════════
-    // ✅ VALIDACIÓN ANTI-FRAUDE: VERIFICAR CAPTURAS DUPLICADAS
+    // ✅ SISTEMA ANTI-FRAUDE: VERIFICAR CAPTURAS DUPLICADAS
     // ═══════════════════════════════════════════════════════════════
     
     try {
-        // Verificar si este file_id ya fue usado en otro pago
+        // 1️⃣ Verificar si este file_id ya fue usado en otro pago
         $sql = "SELECT p.*, u.username, u.first_name 
                 FROM pagos_pendientes p
                 LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
@@ -373,37 +406,47 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         $capturaDuplicada = $stmt->fetch();
         
         if ($capturaDuplicada) {
-            // ¡CAPTURA DUPLICADA DETECTADA!
+            // 🚨 CAPTURA DUPLICADA DETECTADA
+            
+            $otroUsuario = $capturaDuplicada['username'] ? 
+                          "@{$capturaDuplicada['username']}" : 
+                          $capturaDuplicada['first_name'];
             
             // Registrar intento sospechoso
             registrarIntentoDuplicado($db, $telegramId, $pagoId, $fileId, $capturaDuplicada['id']);
             
-            logSecure("⚠️ CAPTURA DUPLICADA DETECTADA - Usuario {$telegramId} intentó usar captura del pago #{$capturaDuplicada['id']}", 'WARN');
+            logSecure("⚠️ CAPTURA DUPLICADA - Usuario {$telegramId} intentó usar captura del pago #{$capturaDuplicada['id']}", 'WARN');
             
-            // Notificar a los administradores
+            // Notificar a administradores
             notificarCapturasDuplicadas($telegramId, $pagoId, $capturaDuplicada, BOT_TOKEN, ADMIN_IDS);
             
             // Mensaje al usuario
             $respuesta = "🚫 *CAPTURA DUPLICADA DETECTADA*\n\n";
             $respuesta .= "Esta imagen ya fue utilizada en otro pago.\n\n";
             $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-            $respuesta .= "⚠️ *IMPORTANTE:*\n";
-            $respuesta .= "• Cada pago debe tener su propia captura única\n";
+            $respuesta .= "⚠️ *SISTEMA ANTI-FRAUDE ACTIVO*\n\n";
+            $respuesta .= "• Cada pago requiere su propia captura única\n";
             $respuesta .= "• No se pueden reutilizar capturas anteriores\n";
-            $respuesta .= "• La captura debe mostrar tu transacción actual\n\n";
+            $respuesta .= "• La captura debe mostrar tu transacción actual\n";
+            $respuesta .= "• Debe incluir fecha y hora visible\n\n";
             $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-            $respuesta .= "📸 *¿Qué hacer?*\n";
-            $respuesta .= "1. Realiza el pago AHORA\n";
-            $respuesta .= "2. Toma una captura NUEVA\n";
-            $respuesta .= "3. Envíala aquí\n\n";
-            $respuesta .= "⚠️ Intentos repetidos de fraude resultarán en suspensión de cuenta.";
+            $respuesta .= "📸 *¿QUÉ HACER?*\n\n";
+            $respuesta .= "1️⃣ Realiza el pago AHORA\n";
+            $respuesta .= "2️⃣ Toma una captura NUEVA\n";
+            $respuesta .= "3️⃣ Asegúrate de que sea legible\n";
+            $respuesta .= "4️⃣ Envíala aquí\n\n";
+            $respuesta .= "⚠️ *ADVERTENCIA FINAL:*\n";
+            $respuesta .= "Intentos repetidos de fraude resultarán en:\n";
+            $respuesta .= "• Suspensión permanente de cuenta\n";
+            $respuesta .= "• Bloqueo de acceso al bot\n";
+            $respuesta .= "• Posible reporte a autoridades";
             
             enviarMensaje($chatId, $respuesta);
             
             return true; // No procesar la captura
         }
         
-        // Verificar si el usuario tiene múltiples intentos recientes de capturas duplicadas
+        // 2️⃣ Verificar intentos recientes de capturas duplicadas
         $sql = "SELECT COUNT(*) as intentos 
                 FROM capturas_duplicadas 
                 WHERE telegram_id = :telegram_id 
@@ -414,7 +457,7 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         $intentosRecientes = $stmt->fetch();
         
         if ($intentosRecientes && $intentosRecientes['intentos'] >= 3) {
-            // Usuario sospechoso - múltiples intentos de fraude
+            // 🚨 USUARIO SOSPECHOSO - múltiples intentos de fraude
             
             logSecure("🚨 USUARIO SOSPECHOSO - {$telegramId} tiene {$intentosRecientes['intentos']} intentos de capturas duplicadas", 'ERROR');
             
@@ -425,8 +468,17 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
             notificarUsuarioSospechoso($telegramId, $intentosRecientes['intentos'], BOT_TOKEN, ADMIN_IDS);
             
             $respuesta = "🚫 *CUENTA SUSPENDIDA*\n\n";
-            $respuesta .= "Tu cuenta ha sido suspendida por intentos repetidos de enviar capturas duplicadas.\n\n";
-            $respuesta .= "Para más información, contacta a @CHAMOGSM";
+            $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+            $respuesta .= "Tu cuenta ha sido suspendida automáticamente por:\n\n";
+            $respuesta .= "• Múltiples intentos de usar capturas duplicadas\n";
+            $respuesta .= "• Comportamiento sospechoso detectado\n";
+            $respuesta .= "• Violación de políticas del servicio\n\n";
+            $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+            $respuesta .= "📞 *Contacto:*\n";
+            $respuesta .= "Si consideras que esto es un error, contacta:\n";
+            $respuesta .= "@CHAMOGSM\n\n";
+            $respuesta .= "⚠️ *Nota:* Deberás proporcionar evidencia válida\n";
+            $respuesta .= "para reactivar tu cuenta.";
             
             enviarMensaje($chatId, $respuesta);
             $estados->limpiarEstado($chatId);
@@ -436,28 +488,30 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
         
     } catch(PDOException $e) {
         logSecure("Error al verificar capturas duplicadas: " . $e->getMessage(), 'ERROR');
-        // Continuar con el proceso si falla la verificación
+        // Continuar con el proceso aunque falle la verificación (fail-safe)
     }
     
     // ═══════════════════════════════════════════════════════════════
-    // FIN DE VALIDACIÓN DE DUPLICADOS
+    // FIN SISTEMA ANTI-FRAUDE
     // ═══════════════════════════════════════════════════════════════
     
     $caption = isset($message['caption']) ? htmlspecialchars($message['caption'], ENT_QUOTES, 'UTF-8') : null;
     
     logSecure("File ID obtenido: {$fileId}", 'INFO');
     
-    // GUARDAR CAPTURA EN BD (una sola vez, con transacción)
+    // GUARDAR CAPTURA EN BD (con transacción atómica)
     try {
         $db->beginTransaction();
         
+        // Usar UPDATE con WHERE para prevenir race conditions
         $sql = "UPDATE pagos_pendientes 
                 SET captura_file_id = :file_id, 
                     captura_caption = :caption,
                     fecha_captura = NOW(),
                     estado = 'captura_enviada'
                 WHERE id = :pago_id
-                AND estado IN ('pendiente', 'esperando_captura')";
+                AND estado IN ('pendiente', 'esperando_captura')
+                AND captura_file_id IS NULL"; // Asegurar que no tenga captura ya
         
         $stmt = $conn->prepare($sql);
         $resultado = $stmt->execute([
@@ -480,20 +534,27 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
             notificarCapturaRecibida($pagoId, $db, $fileId, BOT_TOKEN, ADMIN_IDS);
             
             // Mensaje de confirmación al usuario
-            $respuesta = "✅ *¡CAPTURA RECIBIDA!*\n\n";
+            $respuesta = "✅ *¡CAPTURA RECIBIDA EXITOSAMENTE!*\n\n";
             $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-            $respuesta .= "🆔 Orden: #{$pagoId}\n";
-            $respuesta .= "📸 Captura guardada correctamente\n\n";
+            $respuesta .= "🆔 Orden de Pago: *#{$pagoId}*\n";
+            $respuesta .= "📸 Captura guardada correctamente\n";
+            $respuesta .= "🔐 Validación anti-fraude: ✅ Aprobada\n\n";
             $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
             $respuesta .= "⏳ *PRÓXIMOS PASOS*\n\n";
-            $respuesta .= "1️⃣ Verificación en proceso\n";
+            $respuesta .= "1️⃣ Verificación manual en proceso\n";
             $respuesta .= "2️⃣ Tiempo estimado: 1-24 horas\n";
-            $respuesta .= "3️⃣ Te notificaremos el resultado\n\n";
+            $respuesta .= "3️⃣ Revisión por equipo de soporte\n";
+            $respuesta .= "4️⃣ Notificación automática del resultado\n\n";
             $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-            $respuesta .= "💡 Recibirás notificación cuando:\n";
+            $respuesta .= "💡 *Recibirás notificación cuando:*\n\n";
             $respuesta .= "✅ Tu pago sea aprobado\n";
-            $respuesta .= "❌ Si hay algún problema\n\n";
-            $respuesta .= "📞 Dudas: @CHAMOGSM";
+            $respuesta .= "   → Créditos agregados automáticamente\n\n";
+            $respuesta .= "❌ Si hay algún problema\n";
+            $respuesta .= "   → Instrucciones para corregir\n\n";
+            $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+            $respuesta .= "📞 *¿Dudas?*\n";
+            $respuesta .= "Contacta: @CHAMOGSM\n\n";
+            $respuesta .= "🙏 *¡Gracias por tu paciencia!*";
             
             enviarMensaje($chatId, $respuesta);
             
@@ -502,8 +563,20 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
             
         } else {
             $db->rollBack();
-            logSecure("No se actualizó ninguna fila (posible race condition)", 'ERROR');
-            enviarMensaje($chatId, "❌ Error: El pago ya fue procesado\n\nContacta: @CHAMOGSM");
+            
+            // Verificar si ya tiene captura
+            $stmt = $conn->prepare("SELECT captura_file_id, estado FROM pagos_pendientes WHERE id = ?");
+            $stmt->execute([(int)$pagoId]);
+            $estadoActual = $stmt->fetch();
+            
+            if ($estadoActual && !empty($estadoActual['captura_file_id'])) {
+                logSecure("Pago #{$pagoId} ya tiene captura asociada", 'WARN');
+                enviarMensaje($chatId, "⚠️ *CAPTURA YA ENVIADA*\n\nEste pago ya tiene una captura asociada.\nEstado: {$estadoActual['estado']}");
+            } else {
+                logSecure("No se pudo guardar captura para pago #{$pagoId} - Posible race condition", 'ERROR');
+                enviarMensaje($chatId, "❌ Error al guardar captura\n\nContacta: @CHAMOGSM con el ID: #{$pagoId}");
+            }
+            
             $estados->limpiarEstado($chatId);
             return true;
         }
@@ -511,13 +584,13 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
     } catch(PDOException $e) {
         $db->rollBack();
         
-        // Verificar si es error de constraint UNIQUE (captura duplicada)
+        // Verificar si es error de constraint UNIQUE (captura duplicada a nivel DB)
         if ($e->getCode() == 23000 && strpos($e->getMessage(), 'unique_captura_file_id') !== false) {
-            logSecure("⚠️ CAPTURA DUPLICADA (constraint violation) - Usuario {$telegramId}", 'WARN');
+            logSecure("⚠️ CAPTURA DUPLICADA (DB constraint) - Usuario {$telegramId}, File ID: {$fileId}", 'WARN');
             
-            $respuesta = "🚫 *CAPTURA DUPLICADA*\n\n";
-            $respuesta .= "Esta imagen ya fue utilizada.\n";
-            $respuesta .= "Envía una captura NUEVA de tu pago actual.";
+            $respuesta = "🚫 *CAPTURA DUPLICADA (Validación DB)*\n\n";
+            $respuesta .= "Esta imagen ya fue registrada en el sistema.\n\n";
+            $respuesta .= "📸 Por favor, envía una captura NUEVA de tu pago actual.";
             
             enviarMensaje($chatId, $respuesta);
         } else {
@@ -530,18 +603,18 @@ function procesarCapturaPago($chatId, $telegramId, $message, $db, $sistemaPagos,
 }
 
 /**
- * Notificar a administradores - VERSIÓN CORREGIDA
+ * Notificar a administradores sobre captura recibida
  */
 function notificarCapturaRecibida($pagoId, $db, $fileId, $botToken, $adminIds) {
     try {
         $conn = $db->getConnection();
-        $sql = "SELECT p.*, u.username, u.first_name 
+        $sql = "SELECT p.*, u.username, u.first_name, u.bloqueado
                 FROM pagos_pendientes p
                 LEFT JOIN usuarios u ON p.telegram_id = u.telegram_id
-                WHERE p.id = :id";
+                WHERE p.id = ?";
         
         $stmt = $conn->prepare($sql);
-        $stmt->execute([':id' => (int)$pagoId]);
+        $stmt->execute([(int)$pagoId]);
         $pago = $stmt->fetch();
         
         if (!$pago) {
@@ -550,32 +623,34 @@ function notificarCapturaRecibida($pagoId, $db, $fileId, $botToken, $adminIds) {
         }
         
         $username = !empty($pago['username']) ? "@{$pago['username']}" : $pago['first_name'];
+        $alertaBloqueo = $pago['bloqueado'] ? "\n⚠️ *USUARIO BLOQUEADO*" : "";
         
         $mensaje = "📸 *NUEVA CAPTURA DE PAGO*\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
         $mensaje .= "🆔 Pago ID: *#{$pagoId}*\n";
         $mensaje .= "👤 Usuario: {$username}\n";
-        $mensaje .= "📱 Telegram ID: `{$pago['telegram_id']}`\n";
+        $mensaje .= "📱 Telegram ID: `{$pago['telegram_id']}`{$alertaBloqueo}\n";
         $mensaje .= "📦 Paquete: {$pago['paquete']}\n";
         $mensaje .= "💎 Créditos: {$pago['creditos']}\n";
         $mensaje .= "💰 Monto: {$pago['monto']} {$pago['moneda']}\n";
         $mensaje .= "💳 Método: {$pago['metodo_pago']}\n\n";
         
         if (!empty($pago['captura_caption'])) {
-            $mensaje .= "📝 Nota: {$pago['captura_caption']}\n\n";
+            $mensaje .= "📝 Nota del usuario:\n{$pago['captura_caption']}\n\n";
         }
         
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        $mensaje .= "⚡ *COMANDOS*\n";
+        $mensaje .= "⚡ *ACCIONES RÁPIDAS*\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $mensaje .= "`/detalle {$pagoId}`\n";
-        $mensaje .= "`/aprobar {$pagoId}`\n";
-        $mensaje .= "`/rechazar {$pagoId} [motivo]`";
+        $mensaje .= "`/detalle {$pagoId}` - Ver detalles completos\n";
+        $mensaje .= "`/aprobar {$pagoId}` - Aprobar pago\n";
+        $mensaje .= "`/rechazar {$pagoId} [motivo]` - Rechazar\n\n";
+        $mensaje .= "💡 *Tip:* Verifica que el monto coincida";
         
         $apiUrl = "https://api.telegram.org/bot{$botToken}/";
         
         foreach ($adminIds as $adminId) {
-            // Enviar mensaje
+            // Enviar mensaje de texto
             $url = $apiUrl . 'sendMessage';
             $data = [
                 'chat_id' => $adminId,
@@ -601,12 +676,12 @@ function notificarCapturaRecibida($pagoId, $db, $fileId, $botToken, $adminIds) {
                 continue;
             }
             
-            // Enviar foto
+            // Enviar foto de la captura
             $url = $apiUrl . 'sendPhoto';
             $data = [
                 'chat_id' => $adminId,
                 'photo' => $fileId,
-                'caption' => "📸 Captura pago #{$pagoId}\n\n`/aprobar {$pagoId}`",
+                'caption' => "📸 Captura de pago #{$pagoId}\n\n✅ `/aprobar {$pagoId}`\n❌ `/rechazar {$pagoId} [motivo]`",
                 'parse_mode' => 'Markdown'
             ];
             
@@ -622,7 +697,7 @@ function notificarCapturaRecibida($pagoId, $db, $fileId, $botToken, $adminIds) {
             curl_exec($ch);
             curl_close($ch);
             
-            logSecure("Admin {$adminId} notificado correctamente", 'INFO');
+            logSecure("Admin {$adminId} notificado correctamente sobre pago #{$pagoId}", 'INFO');
         }
         
     } catch(Exception $e) {
@@ -642,6 +717,7 @@ function comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos) {
     }
     
     $username = !empty($pago['username']) ? "@{$pago['username']}" : $pago['first_name'];
+    $alertaBloqueo = $pago['bloqueado'] ? "\n🚫 *USUARIO BLOQUEADO*" : "";
     
     $respuesta = "╔═══════════════════════════╗\n";
     $respuesta .= "║   📋 DETALLE PAGO #{$pago['id']}   ║\n";
@@ -653,7 +729,7 @@ function comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos) {
     $respuesta .= "━━━━━━━━━━━━━━━━━━━━━━━━\n";
     $respuesta .= "• Nombre: {$pago['first_name']}\n";
     $respuesta .= "• Usuario: {$username}\n";
-    $respuesta .= "• ID: `{$pago['telegram_id']}`\n";
+    $respuesta .= "• ID: `{$pago['telegram_id']}`{$alertaBloqueo}\n";
     $respuesta .= "• Créditos actuales: {$pago['creditos_actuales']}\n\n";
     
     $respuesta .= "💰 *DETALLES*\n";
@@ -663,10 +739,28 @@ function comandoDetallePago($chatId, $pagoId, $db, $sistemaPagos) {
     $respuesta .= "• Monto: {$pago['monto']} {$pago['moneda']}\n";
     $respuesta .= "• Método: {$pago['metodo_pago']}\n\n";
     
-    $respuesta .= "📊 *ESTADO*: {$pago['estado']}\n";
+    // Estado con emoji
+    $estadoEmoji = [
+        'pendiente' => '⏳',
+        'esperando_captura' => '📸',
+        'captura_enviada' => '🔍',
+        'aprobado' => '✅',
+        'rechazado' => '❌'
+    ];
+    $emoji = $estadoEmoji[$pago['estado']] ?? '❓';
+    
+    $respuesta .= "📊 *ESTADO*: {$emoji} {$pago['estado']}\n";
+    
+    if ($pago['fecha_captura']) {
+        $respuesta .= "📸 Captura recibida: " . date('d/m/Y H:i', strtotime($pago['fecha_captura'])) . "\n";
+    }
     
     if (!empty($pago['motivo_rechazo'])) {
-        $respuesta .= "\n📝 Motivo rechazo:\n{$pago['motivo_rechazo']}";
+        $respuesta .= "\n❌ *Motivo de rechazo:*\n{$pago['motivo_rechazo']}";
+    }
+    
+    if (!empty($pago['notas_admin'])) {
+        $respuesta .= "\n📝 *Notas del admin:*\n{$pago['notas_admin']}";
     }
     
     enviarMensaje($chatId, $respuesta);
@@ -717,9 +811,10 @@ function comandoAprobarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPago
     if ($resultado['exito']) {
         $respuesta = "✅ *PAGO APROBADO*\n\n";
         $respuesta .= "🆔 Pago: #{$pagoId}\n";
-        $respuesta .= "💎 Créditos: {$resultado['creditos_agregados']}\n\n";
+        $respuesta .= "💎 Créditos agregados: {$resultado['creditos_agregados']}\n\n";
         $respuesta .= "✅ Usuario notificado\n";
-        $respuesta .= "✅ Créditos acreditados";
+        $respuesta .= "✅ Créditos acreditados\n";
+        $respuesta .= "✅ Transacción registrada";
         
         enviarMensaje($chatId, $respuesta);
     } else {
@@ -766,7 +861,7 @@ function comandoRechazarPagoMejorado($chatId, $texto, $adminId, $db, $sistemaPag
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FUNCIONES ANTI-FRAUDE - AGREGADAS
+// FUNCIONES ANTI-FRAUDE
 // ═══════════════════════════════════════════════════════════════
 
 /**
@@ -778,17 +873,17 @@ function registrarIntentoDuplicado($db, $telegramId, $pagoId, $fileId, $pagoOrig
         
         $sql = "INSERT INTO capturas_duplicadas 
                 (telegram_id, pago_id, file_id, pago_original_id, fecha)
-                VALUES (:telegram_id, :pago_id, :file_id, :pago_original_id, NOW())";
+                VALUES (?, ?, ?, ?, NOW())";
         
         $stmt = $conn->prepare($sql);
         $stmt->execute([
-            ':telegram_id' => (int)$telegramId,
-            ':pago_id' => (int)$pagoId,
-            ':file_id' => $fileId,
-            ':pago_original_id' => (int)$pagoOriginalId
+            (int)$telegramId,
+            (int)$pagoId,
+            $fileId,
+            (int)$pagoOriginalId
         ]);
         
-        logSecure("Intento de captura duplicada registrado - Usuario: {$telegramId}, Pago: {$pagoId}", 'WARN');
+        logSecure("Intento de captura duplicada registrado - Usuario: {$telegramId}, Pago: {$pagoId}, Original: {$pagoOriginalId}", 'WARN');
         
     } catch(PDOException $e) {
         logSecure("Error al registrar intento duplicado: " . $e->getMessage(), 'ERROR');
@@ -806,20 +901,23 @@ function notificarCapturasDuplicadas($telegramId, $pagoId, $capturaDuplicada, $b
         
         $mensaje = "🚨 *ALERTA: CAPTURA DUPLICADA*\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $mensaje .= "⚠️ Usuario intentó usar una captura ya utilizada\n\n";
+        $mensaje .= "⚠️ Sistema anti-fraude activado\n\n";
         $mensaje .= "👤 *Usuario sospechoso:*\n";
         $mensaje .= "• ID: `{$telegramId}`\n";
         $mensaje .= "• Pago actual: #{$pagoId}\n\n";
-        $mensaje .= "📸 *Captura original pertenece a:*\n";
+        $mensaje .= "📸 *Captura original usada por:*\n";
         $mensaje .= "• Usuario: {$otroUsuario}\n";
+        $mensaje .= "• ID: `{$capturaDuplicada['telegram_id']}`\n";
         $mensaje .= "• Pago: #{$capturaDuplicada['id']}\n";
         $mensaje .= "• Estado: {$capturaDuplicada['estado']}\n";
         $mensaje .= "• Fecha: " . date('d/m/Y H:i', strtotime($capturaDuplicada['fecha_solicitud'])) . "\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $mensaje .= "⚡ *ACCIONES SUGERIDAS:*\n";
-        $mensaje .= "• Verificar ambos usuarios\n";
-        $mensaje .= "• Considerar bloqueo si es reincidente\n\n";
-        $mensaje .= "`/bloquear {$telegramId}` - Bloquear usuario";
+        $mensaje .= "⚡ *ACCIONES DISPONIBLES:*\n\n";
+        $mensaje .= "`/detalle {$pagoId}` - Ver pago sospechoso\n";
+        $mensaje .= "`/detalle {$capturaDuplicada['id']}` - Ver pago original\n";
+        $mensaje .= "`/bloquear {$telegramId}` - Bloquear usuario\n\n";
+        $mensaje .= "💡 *Recomendación:*\n";
+        $mensaje .= "Verifica ambos pagos antes de tomar acción.";
         
         $apiUrl = "https://api.telegram.org/bot{$botToken}/";
         
@@ -850,23 +948,30 @@ function notificarCapturasDuplicadas($telegramId, $pagoId, $capturaDuplicada, $b
 }
 
 /**
- * Notificar sobre usuario sospechoso con múltiples intentos
+ * Notificar sobre usuario sospechoso
  */
 function notificarUsuarioSospechoso($telegramId, $intentos, $botToken, $adminIds) {
     try {
-        $mensaje = "🚨🚨 *ALERTA URGENTE* 🚨🚨\n\n";
+        $mensaje = "🚨🚨 *ALERTA CRÍTICA* 🚨🚨\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $mensaje .= "⚠️ *USUARIO ALTAMENTE SOSPECHOSO*\n\n";
-        $mensaje .= "👤 ID: `{$telegramId}`\n";
+        $mensaje .= "⚠️ *USUARIO BLOQUEADO AUTOMÁTICAMENTE*\n\n";
+        $mensaje .= "👤 Telegram ID: `{$telegramId}`\n";
         $mensaje .= "🔴 Intentos de fraude: *{$intentos}*\n";
-        $mensaje .= "⏰ Última hora\n\n";
+        $mensaje .= "⏰ Período: Última hora\n";
+        $mensaje .= "🚫 Acción: Bloqueado automáticamente\n\n";
         $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-        $mensaje .= "✅ *ACCIÓN AUTOMÁTICA:*\n";
-        $mensaje .= "Usuario bloqueado automáticamente\n\n";
-        $mensaje .= "📋 *REVISAR:*\n";
-        $mensaje .= "• Historial de pagos\n";
-        $mensaje .= "• Otros intentos sospechosos\n";
-        $mensaje .= "• Considerar reporte a autoridades si persiste";
+        $mensaje .= "📋 *ACCIONES REALIZADAS:*\n\n";
+        $mensaje .= "✅ Usuario bloqueado\n";
+        $mensaje .= "✅ Intentos registrados\n";
+        $mensaje .= "✅ Alertas enviadas\n\n";
+        $mensaje .= "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        $mensaje .= "🔍 *INVESTIGAR:*\n\n";
+        $mensaje .= "`/detalle` - Ver todos los pagos del usuario\n";
+        $mensaje .= "`SELECT * FROM capturas_duplicadas WHERE telegram_id={$telegramId}`\n\n";
+        $mensaje .= "⚠️ Si el patrón persiste, considerar:\n";
+        $mensaje .= "• Bloqueo permanente\n";
+        $mensaje .= "• Reporte a plataforma\n";
+        $mensaje .= "• Documentación para autoridades";
         
         $apiUrl = "https://api.telegram.org/bot{$botToken}/";
         

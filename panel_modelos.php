@@ -2,7 +2,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  * PANEL WEB - GESTIÓN DE MODELOS TAC
- * Sistema CRUD completo para administrar base de datos de modelos
+ * VERSIÓN 3.0 - SEGURIDAD MEJORADA CON BCRYPT
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -15,31 +15,163 @@ require_once(__DIR__ . '/Database.php');
 // CONFIGURACIÓN DE SEGURIDAD
 // ========================================
 
-// Contraseña del panel (cámbiala por una segura)
-define('PANEL_PASSWORD', 'admin123'); // 🔒 CAMBIA ESTA CONTRASEÑA
+// Obtener contraseña desde variable de entorno
+$PANEL_PASSWORD_HASH = getenv('PANEL_PASSWORD_HASH');
 
-// Modo debug (activar solo para troubleshooting)
-define('DEBUG_MODE', false); // Cambiar a true para ver errores detallados
+// Si no existe hash, crear uno temporal (SOLO para primera vez)
+if (empty($PANEL_PASSWORD_HASH)) {
+    // Generar hash de la contraseña del .env
+    $plainPassword = getenv('PANEL_PASSWORD') ?: 'CAMBIAR_ESTO_URGENTE';
+    $PANEL_PASSWORD_HASH = password_hash($plainPassword, PASSWORD_BCRYPT);
+    
+    // Mostrar advertencia en logs
+    logSecure("ADVERTENCIA: Usando hash temporal. Agrega PANEL_PASSWORD_HASH al .env", 'WARN');
+}
+
+// Modo debug
+define('DEBUG_MODE', ENABLE_DEBUG);
 
 // Configurar errores según modo debug
-if (DEBUG_MODE) {
-    error_reporting(E_ALL);
-    ini_set('display_errors', 1);
-    ini_set('log_errors', 1);
-} else {
+if (!DEBUG_MODE) {
     error_reporting(0);
     ini_set('display_errors', 0);
 }
 
-// Verificar autenticación
-if (!isset($_SESSION['panel_authenticated'])) {
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
-        if ($_POST['password'] === PANEL_PASSWORD) {
+// ========================================
+// SISTEMA DE PROTECCIÓN CONTRA FUERZA BRUTA
+// ========================================
+
+class LoginProtection {
+    private $maxAttempts = 5;
+    private $lockoutTime = 900; // 15 minutos
+    private $attemptsFile = '/tmp/panel_login_attempts.json';
+    
+    public function recordAttempt($ip) {
+        $attempts = $this->getAttempts();
+        
+        if (!isset($attempts[$ip])) {
+            $attempts[$ip] = [
+                'count' => 0,
+                'first_attempt' => time(),
+                'locked_until' => 0
+            ];
+        }
+        
+        $attempts[$ip]['count']++;
+        $attempts[$ip]['last_attempt'] = time();
+        
+        // Bloquear si excede intentos
+        if ($attempts[$ip]['count'] >= $this->maxAttempts) {
+            $attempts[$ip]['locked_until'] = time() + $this->lockoutTime;
+        }
+        
+        $this->saveAttempts($attempts);
+    }
+    
+    public function isLocked($ip) {
+        $attempts = $this->getAttempts();
+        
+        if (!isset($attempts[$ip])) {
+            return false;
+        }
+        
+        // Verificar si el bloqueo expiró
+        if ($attempts[$ip]['locked_until'] > 0 && time() < $attempts[$ip]['locked_until']) {
+            return true;
+        }
+        
+        // Limpiar si ya pasó el tiempo
+        if ($attempts[$ip]['locked_until'] > 0 && time() >= $attempts[$ip]['locked_until']) {
+            unset($attempts[$ip]);
+            $this->saveAttempts($attempts);
+            return false;
+        }
+        
+        return false;
+    }
+    
+    public function clearAttempts($ip) {
+        $attempts = $this->getAttempts();
+        unset($attempts[$ip]);
+        $this->saveAttempts($attempts);
+    }
+    
+    public function getRemainingLockTime($ip) {
+        $attempts = $this->getAttempts();
+        
+        if (!isset($attempts[$ip]) || $attempts[$ip]['locked_until'] == 0) {
+            return 0;
+        }
+        
+        $remaining = $attempts[$ip]['locked_until'] - time();
+        return max(0, $remaining);
+    }
+    
+    private function getAttempts() {
+        if (!file_exists($this->attemptsFile)) {
+            return [];
+        }
+        
+        $content = @file_get_contents($this->attemptsFile);
+        if ($content === false) {
+            return [];
+        }
+        
+        $attempts = json_decode($content, true);
+        return is_array($attempts) ? $attempts : [];
+    }
+    
+    private function saveAttempts($attempts) {
+        @file_put_contents($this->attemptsFile, json_encode($attempts), LOCK_EX);
+    }
+}
+
+$loginProtection = new LoginProtection();
+$userIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+
+// ========================================
+// VERIFICAR AUTENTICACIÓN
+// ========================================
+
+if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated'] !== true) {
+    // Verificar si está bloqueado
+    if ($loginProtection->isLocked($userIp)) {
+        $remaining = $loginProtection->getRemainingLockTime($userIp);
+        $minutes = ceil($remaining / 60);
+        
+        $login_error = "Demasiados intentos fallidos. Bloqueado por {$minutes} minutos.";
+        logSecure("Intento de acceso bloqueado desde IP: {$userIp}", 'WARN');
+    } 
+    // Procesar intento de login
+    elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
+        $inputPassword = $_POST['password'];
+        
+        // Verificar contraseña con bcrypt
+        if (password_verify($inputPassword, $PANEL_PASSWORD_HASH)) {
+            // Login exitoso
             $_SESSION['panel_authenticated'] = true;
+            $_SESSION['panel_login_time'] = time();
+            $_SESSION['panel_ip'] = $userIp;
+            
+            // Limpiar intentos fallidos
+            $loginProtection->clearAttempts($userIp);
+            
+            logSecure("Login exitoso al panel desde IP: {$userIp}", 'INFO');
+            
+            // Regenerar ID de sesión por seguridad
+            session_regenerate_id(true);
+            
             header('Location: ' . $_SERVER['PHP_SELF']);
             exit;
         } else {
+            // Login fallido
+            $loginProtection->recordAttempt($userIp);
             $login_error = "Contraseña incorrecta";
+            
+            logSecure("Intento de login fallido desde IP: {$userIp}", 'WARN');
+            
+            // Agregar delay para dificultar fuerza bruta
+            sleep(2);
         }
     }
     
@@ -115,12 +247,27 @@ if (!isset($_SESSION['panel_authenticated'])) {
                 transform: translateY(-2px);
             }
             
+            .login-box button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+            
             .error {
                 background: #f8d7da;
                 color: #721c24;
                 padding: 10px;
                 border-radius: 5px;
                 margin-bottom: 20px;
+                font-size: 14px;
+            }
+            
+            .info {
+                background: #d1ecf1;
+                color: #0c5460;
+                padding: 10px;
+                border-radius: 5px;
+                margin-top: 20px;
+                font-size: 12px;
             }
         </style>
     </head>
@@ -128,12 +275,32 @@ if (!isset($_SESSION['panel_authenticated'])) {
         <div class="login-box">
             <h1>🔐 Panel de Modelos TAC</h1>
             <?php if (isset($login_error)): ?>
-                <div class="error"><?php echo $login_error; ?></div>
+                <div class="error"><?php echo htmlspecialchars($login_error); ?></div>
             <?php endif; ?>
-            <form method="POST">
-                <input type="password" name="password" placeholder="Contraseña" required autofocus>
-                <button type="submit">Ingresar</button>
-            </form>
+            
+            <?php if ($loginProtection->isLocked($userIp)): ?>
+                <div class="error">
+                    🚫 Acceso temporalmente bloqueado<br>
+                    Espera <?php echo ceil($loginProtection->getRemainingLockTime($userIp) / 60); ?> minutos
+                </div>
+            <?php else: ?>
+                <form method="POST">
+                    <input 
+                        type="password" 
+                        name="password" 
+                        placeholder="Contraseña" 
+                        required 
+                        autofocus
+                        autocomplete="current-password"
+                    >
+                    <button type="submit">Ingresar</button>
+                </form>
+                
+                <div class="info">
+                    🔒 Protegido con encriptación bcrypt<br>
+                    Máximo 5 intentos antes del bloqueo
+                </div>
+            <?php endif; ?>
         </div>
     </body>
     </html>
@@ -142,10 +309,36 @@ if (!isset($_SESSION['panel_authenticated'])) {
 }
 
 // ========================================
+// VALIDACIÓN DE SESIÓN ACTIVA
+// ========================================
+
+// Verificar timeout de sesión (30 minutos)
+$sessionTimeout = 1800; // 30 minutos
+if (isset($_SESSION['panel_login_time'])) {
+    if (time() - $_SESSION['panel_login_time'] > $sessionTimeout) {
+        session_destroy();
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+}
+
+// Actualizar tiempo de última actividad
+$_SESSION['panel_login_time'] = time();
+
+// Verificar que la IP no haya cambiado (seguridad adicional)
+if (isset($_SESSION['panel_ip']) && $_SESSION['panel_ip'] !== $userIp) {
+    logSecure("Cambio de IP detectado en sesión activa. IP original: {$_SESSION['panel_ip']}, Nueva IP: {$userIp}", 'WARN');
+    session_destroy();
+    header('Location: ' . $_SERVER['PHP_SELF']);
+    exit;
+}
+
+// ========================================
 // CERRAR SESIÓN
 // ========================================
 
 if (isset($_GET['logout'])) {
+    logSecure("Logout del panel desde IP: {$userIp}", 'INFO');
     session_destroy();
     header('Location: ' . $_SERVER['PHP_SELF']);
     exit;
@@ -233,7 +426,7 @@ try {
             <div class='error-detail'>" . htmlspecialchars($e->getMessage()) . "</div>
             <p style='margin-top: 20px;'><strong>Posibles soluciones:</strong></p>
             <ul style='text-align: left; color: #666; line-height: 2;'>
-                <li>Verifica la configuración en <code>config_bot.php</code></li>
+                <li>Verifica la configuración en el archivo <code>.env</code></li>
                 <li>Asegúrate de que la base de datos existe</li>
                 <li>Verifica que el usuario tenga permisos</li>
                 <li>Ejecuta el script SQL de instalación</li>
@@ -246,11 +439,32 @@ try {
 }
 
 // ========================================
+// PROTECCIÓN CSRF
+// ========================================
+
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+function verifyCsrfToken() {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $token = $_POST['csrf_token'] ?? '';
+        if (!hash_equals($_SESSION['csrf_token'], $token)) {
+            logSecure("Intento de CSRF detectado", 'WARN');
+            die("Error de seguridad: Token CSRF inválido");
+        }
+    }
+}
+
+// ========================================
 // PROCESAR ACCIONES
 // ========================================
 
 $message = '';
 $message_type = '';
+
+// Verificar CSRF en todas las acciones POST
+verifyCsrfToken();
 
 // CREAR NUEVO MODELO
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create') {
@@ -261,35 +475,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     
     if (strlen($tac) === 8 && !empty($modelo)) {
         try {
-            // Verificar si ya existe
-            $check = $conn->prepare("SELECT id FROM tac_modelos WHERE tac = ?");
-            $check->execute([$tac]);
+            // Usar método de DB que ya maneja duplicados
+            $resultado = $db->guardarModelo($tac, $modelo, $marca, $fuente);
             
-            if ($check->rowCount() > 0) {
-                $message = "Ya existe un modelo con este TAC. Usa la opción de editar en su lugar.";
-                $message_type = 'error';
-            } else {
-                // INSERT simplificado - solo columnas esenciales
-                $sql = "INSERT INTO tac_modelos (tac, modelo, marca, fuente, ultima_consulta)
-                        VALUES (?, ?, ?, ?, NOW())";
-                
-                $stmt = $conn->prepare($sql);
-                $stmt->execute([
-                    $tac,
-                    $modelo,
-                    $marca,
-                    $fuente
-                ]);
-                
-                $message = "Modelo agregado exitosamente";
+            if ($resultado) {
+                $message = "Modelo agregado/actualizado exitosamente";
                 $message_type = 'success';
+                logSecure("Modelo TAC {$tac} agregado/actualizado por admin desde IP: {$userIp}", 'INFO');
+            } else {
+                $message = "Error al guardar el modelo";
+                $message_type = 'error';
             }
         } catch (PDOException $e) {
             $message = "Error al agregar modelo: " . $e->getMessage();
             $message_type = 'error';
-            if (function_exists('logSecure')) {
-                logSecure("Error al agregar modelo: " . $e->getMessage(), 'ERROR');
-            }
+            logSecure("Error al agregar modelo: " . $e->getMessage(), 'ERROR');
         }
     } else {
         $message = "TAC inválido (debe tener 8 dígitos) o modelo vacío";
@@ -321,16 +521,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             if ($stmt->rowCount() > 0) {
                 $message = "Modelo actualizado exitosamente";
                 $message_type = 'success';
+                logSecure("Modelo ID {$id} actualizado por admin", 'INFO');
             } else {
                 $message = "No se realizaron cambios";
-                $message_type = 'error';
+                $message_type = 'warning';
             }
         } catch (PDOException $e) {
             $message = "Error al actualizar modelo: " . $e->getMessage();
             $message_type = 'error';
-            if (function_exists('logSecure')) {
-                logSecure("Error al actualizar modelo: " . $e->getMessage(), 'ERROR');
-            }
+            logSecure("Error al actualizar modelo: " . $e->getMessage(), 'ERROR');
         }
     } else {
         $message = "ID inválido o modelo vacío";
@@ -344,7 +543,6 @@ if (isset($_GET['delete'])) {
     
     if ($id > 0) {
         try {
-            // Primero obtener info del modelo para mostrar en mensaje
             $info = $conn->prepare("SELECT tac, modelo FROM tac_modelos WHERE id = ?");
             $info->execute([$id]);
             $modelo_info = $info->fetch(PDO::FETCH_ASSOC);
@@ -357,6 +555,7 @@ if (isset($_GET['delete'])) {
                 if ($stmt->rowCount() > 0) {
                     $message = "Modelo eliminado: {$modelo_info['modelo']} (TAC: {$modelo_info['tac']})";
                     $message_type = 'success';
+                    logSecure("Modelo TAC {$modelo_info['tac']} eliminado por admin", 'INFO');
                 } else {
                     $message = "No se pudo eliminar el modelo";
                     $message_type = 'error';
@@ -368,9 +567,7 @@ if (isset($_GET['delete'])) {
         } catch (PDOException $e) {
             $message = "Error al eliminar: " . $e->getMessage();
             $message_type = 'error';
-            if (function_exists('logSecure')) {
-                logSecure("Error al eliminar modelo #{$id}: " . $e->getMessage(), 'ERROR');
-            }
+            logSecure("Error al eliminar modelo #{$id}: " . $e->getMessage(), 'ERROR');
         }
     } else {
         $message = "ID inválido";
@@ -379,7 +576,7 @@ if (isset($_GET['delete'])) {
 }
 
 // ========================================
-// BÚSQUEDA Y FILTROS
+// BÚSQUEDA Y FILTROS - CON PROTECCIÓN SQL INJECTION
 // ========================================
 
 $search = isset($_GET['search']) ? trim($_GET['search']) : '';
@@ -388,111 +585,72 @@ $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
 $per_page = 20;
 $offset = ($page - 1) * $per_page;
 
-// Asegurar que $per_page y $offset son integers
-$per_page = (int)$per_page;
-$offset = (int)$offset;
-
-// Construir query de forma segura
-$where = [];
-$params = [];
-
-if (!empty($search)) {
-    $where[] = "(tac LIKE ? OR modelo LIKE ? OR marca LIKE ?)";
-    $search_param = "%{$search}%";
-}
-
-if (!empty($fuente_filter)) {
-    $where[] = "fuente = ?";
-}
-
-$where_clause = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
-
 try {
-    // Preparar array de parámetros en orden correcto
-    $bind_params = [];
+    $where = [];
+    $params = [];
     
     if (!empty($search)) {
-        $bind_params[] = "%{$search}%";
-        $bind_params[] = "%{$search}%";
-        $bind_params[] = "%{$search}%";
+        $where[] = "(tac LIKE ? OR modelo LIKE ? OR marca LIKE ?)";
+        $search_param = "%{$search}%";
+        $params[] = $search_param;
+        $params[] = $search_param;
+        $params[] = $search_param;
     }
     
     if (!empty($fuente_filter)) {
-        $bind_params[] = $fuente_filter;
+        $where[] = "fuente = ?";
+        $params[] = $fuente_filter;
     }
     
-    // Contar total
+    $where_clause = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
+    
+    // Contar total - CON PLACEHOLDERS
     $count_sql = "SELECT COUNT(*) as total FROM tac_modelos {$where_clause}";
     $stmt = $conn->prepare($count_sql);
-    
-    if (!empty($bind_params)) {
-        $stmt->execute($bind_params);
-    } else {
-        $stmt->execute();
-    }
+    $stmt->execute($params);
     
     $result = $stmt->fetch(PDO::FETCH_ASSOC);
     $total_records = $result ? (int)$result['total'] : 0;
     $total_pages = $total_records > 0 ? (int)ceil($total_records / $per_page) : 0;
     
-    // Obtener registros
+    // Obtener registros - CON PLACEHOLDERS
     $sql = "SELECT * FROM tac_modelos {$where_clause} 
             ORDER BY veces_usado DESC, ultima_consulta DESC 
-            LIMIT {$per_page} OFFSET {$offset}";
+            LIMIT ? OFFSET ?";
     
     $stmt = $conn->prepare($sql);
-    
-    if (!empty($bind_params)) {
-        $stmt->execute($bind_params);
-    } else {
-        $stmt->execute();
-    }
+    $params[] = $per_page;
+    $params[] = $offset;
+    $stmt->execute($params);
     
     $modelos = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     // Obtener estadísticas
-    try {
-        $stats_sql = "SELECT 
-                        COUNT(*) as total_modelos,
-                        COUNT(DISTINCT marca) as total_marcas,
-                        COALESCE(SUM(veces_usado), 0) as total_usos,
-                        COUNT(CASE WHEN fuente = 'imeidb_api' THEN 1 END) as de_api,
-                        COUNT(CASE WHEN fuente = 'usuario' THEN 1 END) as de_usuarios
-                      FROM tac_modelos";
-        $stats_stmt = $conn->query($stats_sql);
-        $stats = $stats_stmt->fetch(PDO::FETCH_ASSOC);
-        
-        // Asegurar valores numéricos
-        $stats['total_modelos'] = (int)$stats['total_modelos'];
-        $stats['total_marcas'] = (int)$stats['total_marcas'];
-        $stats['total_usos'] = (int)$stats['total_usos'];
-        $stats['de_api'] = (int)$stats['de_api'];
-        $stats['de_usuarios'] = (int)$stats['de_usuarios'];
-    } catch (PDOException $e) {
-        logSecure("Error al obtener estadísticas: " . $e->getMessage(), 'ERROR');
-        $stats = [
-            'total_modelos' => 0,
-            'total_marcas' => 0,
-            'total_usos' => 0,
-            'de_api' => 0,
-            'de_usuarios' => 0
-        ];
-    }
+    $stats_sql = "SELECT 
+                    COUNT(*) as total_modelos,
+                    COUNT(DISTINCT marca) as total_marcas,
+                    COALESCE(SUM(veces_usado), 0) as total_usos,
+                    COUNT(CASE WHEN fuente = 'imeidb_api' THEN 1 END) as de_api,
+                    COUNT(CASE WHEN fuente = 'usuario' THEN 1 END) as de_usuarios
+                  FROM tac_modelos";
+    $stats_stmt = $conn->query($stats_sql);
+    $stats = $stats_stmt->fetch(PDO::FETCH_ASSOC);
+    
+    // Asegurar valores numéricos
+    $stats['total_modelos'] = (int)$stats['total_modelos'];
+    $stats['total_marcas'] = (int)$stats['total_marcas'];
+    $stats['total_usos'] = (int)$stats['total_usos'];
+    $stats['de_api'] = (int)$stats['de_api'];
+    $stats['de_usuarios'] = (int)$stats['de_usuarios'];
     
     // Obtener fuentes disponibles
-    try {
-        $fuentes_sql = "SELECT DISTINCT fuente FROM tac_modelos WHERE fuente IS NOT NULL ORDER BY fuente";
-        $fuentes_stmt = $conn->query($fuentes_sql);
-        $fuentes = $fuentes_stmt->fetchAll(PDO::FETCH_COLUMN);
-    } catch (PDOException $e) {
-        logSecure("Error al obtener fuentes: " . $e->getMessage(), 'ERROR');
-        $fuentes = [];
-    }
+    $fuentes_sql = "SELECT DISTINCT fuente FROM tac_modelos WHERE fuente IS NOT NULL ORDER BY fuente";
+    $fuentes_stmt = $conn->query($fuentes_sql);
+    $fuentes = $fuentes_stmt->fetchAll(PDO::FETCH_COLUMN);
     
 } catch (PDOException $e) {
     logSecure("Error en consulta de modelos: " . $e->getMessage(), 'ERROR');
     
-    // Valores por defecto en caso de error
     $modelos = [];
     $total_records = 0;
     $total_pages = 0;
@@ -555,6 +713,14 @@ try {
         .header .actions {
             display: flex;
             gap: 10px;
+        }
+        
+        .session-info {
+            background: rgba(255,255,255,0.2);
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 12px;
+            margin-top: 10px;
         }
         
         .btn {
@@ -657,6 +823,12 @@ try {
             background: #f8d7da;
             color: #721c24;
             border: 1px solid #f5c6cb;
+        }
+        
+        .message.warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
         }
         
         .search-bar {
@@ -887,6 +1059,10 @@ try {
             <div>
                 <h1>📱 Panel de Modelos TAC</h1>
                 <p style="opacity: 0.9; margin-top: 5px;">Gestión de base de datos de dispositivos</p>
+                <div class="session-info">
+                    🔒 Sesión segura | IP: <?php echo htmlspecialchars($userIp); ?> | 
+                    Tiempo restante: <span id="sessionTimer">30:00</span>
+                </div>
             </div>
             <div class="actions">
                 <button class="btn btn-primary" onclick="openModal('create')">➕ Agregar Modelo</button>
@@ -1052,6 +1228,7 @@ try {
             <div class="modal-header" id="modalTitle">Agregar Modelo</div>
             
             <form method="POST" id="modelForm">
+                <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
                 <input type="hidden" name="action" id="formAction" value="create">
                 <input type="hidden" name="id" id="modeloId">
                 
@@ -1109,6 +1286,35 @@ try {
     </div>
     
     <script>
+        // Temporizador de sesión
+        let sessionTimeout = 1800; // 30 minutos en segundos
+        let sessionTimer = setInterval(function() {
+            sessionTimeout--;
+            
+            if (sessionTimeout <= 0) {
+                alert('Tu sesión ha expirado. Serás redirigido al login.');
+                window.location.reload();
+                return;
+            }
+            
+            let minutes = Math.floor(sessionTimeout / 60);
+            let seconds = sessionTimeout % 60;
+            document.getElementById('sessionTimer').textContent = 
+                minutes.toString().padStart(2, '0') + ':' + 
+                seconds.toString().padStart(2, '0');
+            
+            // Advertir cuando queden 5 minutos
+            if (sessionTimeout === 300) {
+                if (confirm('Tu sesión expirará en 5 minutos. ¿Deseas renovarla?')) {
+                    // Hacer una petición silenciosa para renovar
+                    fetch(window.location.href).then(() => {
+                        sessionTimeout = 1800;
+                        alert('Sesión renovada por 30 minutos más');
+                    });
+                }
+            }
+        }, 1000);
+        
         function openModal(action, data = null) {
             const modal = document.getElementById('modalForm');
             const form = document.getElementById('modelForm');
@@ -1120,6 +1326,9 @@ try {
                 title.textContent = 'Agregar Nuevo Modelo';
                 formAction.value = 'create';
                 form.reset();
+                // Restaurar token CSRF
+                form.querySelector('input[name="csrf_token"]').value = '<?php echo $_SESSION['csrf_token']; ?>';
+                formAction.value = 'create';
                 tacInput.readOnly = false;
             } else if (action === 'edit' && data) {
                 title.textContent = 'Editar Modelo';
@@ -1131,7 +1340,7 @@ try {
                 document.getElementById('marca').value = data.marca || '';
                 document.getElementById('fuente').value = data.fuente;
                 
-                tacInput.readOnly = true; // No permitir cambiar TAC al editar
+                tacInput.readOnly = true;
             }
             
             modal.classList.add('active');
@@ -1151,6 +1360,23 @@ try {
         // Validar TAC en tiempo real
         document.getElementById('tac').addEventListener('input', function(e) {
             this.value = this.value.replace(/[^0-9]/g, '').substring(0, 8);
+        });
+        
+        // Confirmar antes de salir si hay cambios sin guardar
+        let formChanged = false;
+        document.getElementById('modelForm').addEventListener('change', function() {
+            formChanged = true;
+        });
+        
+        document.getElementById('modelForm').addEventListener('submit', function() {
+            formChanged = false;
+        });
+        
+        window.addEventListener('beforeunload', function(e) {
+            if (formChanged) {
+                e.preventDefault();
+                e.returnValue = '';
+            }
         });
     </script>
 </body>

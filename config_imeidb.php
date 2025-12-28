@@ -5,18 +5,19 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
-// API Key desde variable de entorno o valor por defecto
-define('IMEIDB_API_KEY', getenv('IMEIDB_API_KEY') ?: 'XdjQg-NF1Bke1_BIj1Vr');
+// API Key desde variable de entorno
+define('IMEIDB_API_KEY', getenv('IMEIDB_API_KEY') ?: '');
 
 // Configuración de la API
 define('IMEIDB_API_URL', 'https://imeidb.xyz/api/imei');
 define('IMEIDB_CACHE_TIME', 2592000); // 30 días
 define('IMEIDB_RATE_LIMIT', 1); // Segundos entre peticiones
 define('IMEIDB_TIMEOUT', 15); // Timeout de peticiones
+define('IMEIDB_MAX_RETRIES', 3); // Intentos de reconexión
 
 // Validar API key
-if (IMEIDB_API_KEY === 'TU_API_KEY_AQUI' || empty(IMEIDB_API_KEY)) {
-    error_log("ADVERTENCIA: IMEIDB_API_KEY no configurada. El bot usará solo base de datos local.");
+if (empty(IMEIDB_API_KEY)) {
+    logSecure("ADVERTENCIA: IMEIDB_API_KEY no configurada. Se usará solo base de datos local.", 'WARN');
 }
 
 ?>

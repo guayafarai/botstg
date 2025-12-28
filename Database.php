@@ -1,7 +1,8 @@
 <?php
 /**
  * ═══════════════════════════════════════════════════════════════
- * CLASE DATABASE MEJORADA - VERSIÓN SEGURA
+ * CLASE DATABASE MEJORADA - VERSIÓN SEGURA Y CORREGIDA
+ * VERSIÓN: 2.1 - Fix registrarUsuario() duplicados
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -60,76 +61,107 @@ class Database {
     
     /**
      * Registrar o actualizar usuario
+     * ✅ VERSIÓN CORREGIDA - Sin duplicación de transacciones
      */
-public function registrarUsuario($telegramId, $username, $firstName, $lastName)
-{
-    try {
-        // 1️⃣ Verificar si el usuario ya existe
-        $check = $this->conn->prepare("
-            SELECT id 
-            FROM usuarios 
-            WHERE telegram_id = ?
-            LIMIT 1
-        ");
-        $check->execute([(int)$telegramId]);
-
-        if ($check->fetch(PDO::FETCH_ASSOC)) {
-            // 🔁 Usuario existente → solo actualizar datos básicos
-            $update = $this->conn->prepare("
-                UPDATE usuarios 
-                SET username = ?, 
-                    first_name = ?, 
-                    last_name = ?, 
-                    ultima_actividad = CURRENT_TIMESTAMP
+    public function registrarUsuario($telegramId, $username, $firstName, $lastName)
+    {
+        try {
+            // Iniciar transacción para garantizar atomicidad
+            $this->beginTransaction();
+            
+            // 1️⃣ Verificar si el usuario ya existe
+            $check = $this->conn->prepare("
+                SELECT id, creditos, fecha_registro 
+                FROM usuarios 
                 WHERE telegram_id = ?
+                LIMIT 1
+            ");
+            $check->execute([(int)$telegramId]);
+
+            if ($usuarioExistente = $check->fetch(PDO::FETCH_ASSOC)) {
+                // 🔁 Usuario existente → SOLO actualizar datos básicos
+                $update = $this->conn->prepare("
+                    UPDATE usuarios 
+                    SET username = ?, 
+                        first_name = ?, 
+                        last_name = ?, 
+                        ultima_actividad = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                ");
+
+                $resultado = $update->execute([
+                    $this->sanitize($username),
+                    $this->sanitize($firstName),
+                    $this->sanitize($lastName),
+                    (int)$telegramId
+                ]);
+                
+                $this->commit();
+                
+                logSecure(
+                    "Usuario existente actualizado - ID: {$telegramId}, Username: {$username}",
+                    'DEBUG'
+                );
+
+                return false; // ❌ NO es nuevo - SIN transacción
+            }
+
+            // 2️⃣ Usuario nuevo → Insertar + Regalar créditos
+            $creditosRegalo = (int)CREDITOS_REGISTRO;
+            
+            $insert = $this->conn->prepare("
+                INSERT INTO usuarios 
+                    (telegram_id, username, first_name, last_name, creditos, fecha_registro)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ");
 
-            $update->execute([
+            $resultado = $insert->execute([
+                (int)$telegramId,
                 $this->sanitize($username),
                 $this->sanitize($firstName),
                 $this->sanitize($lastName),
-                (int)$telegramId
+                $creditosRegalo
             ]);
+            
+            if (!$resultado) {
+                throw new Exception("Error al insertar usuario");
+            }
 
-            return false; // ❌ NO es nuevo
+            // 3️⃣ Registrar transacción ÚNICA de bienvenida
+            $transaccion = $this->conn->prepare("
+                INSERT INTO transacciones 
+                    (telegram_id, tipo, cantidad, descripcion, fecha)
+                VALUES (?, 'registro', ?, 'Créditos de bienvenida - Nuevo usuario', CURRENT_TIMESTAMP)
+            ");
+            
+            $transaccion->execute([
+                (int)$telegramId,
+                $creditosRegalo
+            ]);
+            
+            $this->commit();
+            
+            logSecure(
+                "Usuario nuevo registrado exitosamente - ID: {$telegramId}, Username: {$username}, Créditos: {$creditosRegalo}",
+                'INFO'
+            );
+
+            return true; // ✅ Usuario nuevo - CON transacción única
+
+        } catch (PDOException $e) {
+            // Revertir si hay error
+            if ($this->inTransaction) {
+                $this->rollBack();
+            }
+            
+            logSecure(
+                "Error al registrar usuario {$telegramId}: " . $e->getMessage(),
+                'ERROR'
+            );
+            
+            return false;
         }
-
-        // 2️⃣ Usuario nuevo → insertar + regalar créditos
-        $insert = $this->conn->prepare("
-            INSERT INTO usuarios 
-                (telegram_id, username, first_name, last_name, creditos)
-            VALUES (?, ?, ?, ?, ?)
-        ");
-
-        $creditos = (int)CREDITOS_REGISTRO;
-
-        $insert->execute([
-            (int)$telegramId,
-            $this->sanitize($username),
-            $this->sanitize($firstName),
-            $this->sanitize($lastName),
-            $creditos
-        ]);
-
-        // Registrar transacción SOLO una vez
-        $this->registrarTransaccion(
-            $telegramId,
-            'registro',
-            $creditos,
-            'Créditos de bienvenida'
-        );
-
-        return true; // ✅ Usuario nuevo
-
-    } catch (PDOException $e) {
-        logSecure(
-            "Error al registrar usuario {$telegramId}: " . $e->getMessage(),
-            'ERROR'
-        );
-        return false;
     }
-}
-
     
     /**
      * Obtener información de usuario

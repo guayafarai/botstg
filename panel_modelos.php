@@ -2,180 +2,228 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  * PANEL WEB - GESTIÓN DE MODELOS TAC
- * VERSIÓN 3.0 - SEGURIDAD MEJORADA CON BCRYPT
+ * VERSIÓN 4.0 - LOGIN CON BASE DE DATOS SQL
  * ═══════════════════════════════════════════════════════════════
  */
 
+ob_start();
 session_start();
 
 require_once(__DIR__ . '/config_bot.php');
 require_once(__DIR__ . '/Database.php');
 
 // ========================================
-// CONFIGURACIÓN DE SEGURIDAD
+// CLASE DE AUTENTICACIÓN
 // ========================================
 
-// Obtener contraseña desde variable de entorno
-$PANEL_PASSWORD_HASH = getenv('PANEL_PASSWORD_HASH');
-
-// Si no existe hash, crear uno temporal (SOLO para primera vez)
-if (empty($PANEL_PASSWORD_HASH)) {
-    // Generar hash de la contraseña del .env
-    $plainPassword = getenv('PANEL_PASSWORD') ?: 'CAMBIAR_ESTO_URGENTE';
-    $PANEL_PASSWORD_HASH = password_hash($plainPassword, PASSWORD_BCRYPT);
-    
-    // Mostrar advertencia en logs
-    logSecure("ADVERTENCIA: Usando hash temporal. Agrega PANEL_PASSWORD_HASH al .env", 'WARN');
-}
-
-// Modo debug
-define('DEBUG_MODE', ENABLE_DEBUG);
-
-// Configurar errores según modo debug
-if (!DEBUG_MODE) {
-    error_reporting(0);
-    ini_set('display_errors', 0);
-}
-
-// ========================================
-// SISTEMA DE PROTECCIÓN CONTRA FUERZA BRUTA
-// ========================================
-
-class LoginProtection {
+class PanelAuth {
+    private $db;
+    private $conn;
     private $maxAttempts = 5;
     private $lockoutTime = 900; // 15 minutos
-    private $attemptsFile = '/tmp/panel_login_attempts.json';
     
-    public function recordAttempt($ip) {
-        $attempts = $this->getAttempts();
-        
-        if (!isset($attempts[$ip])) {
-            $attempts[$ip] = [
-                'count' => 0,
-                'first_attempt' => time(),
-                'locked_until' => 0
+    public function __construct($database) {
+        $this->db = $database;
+        $this->conn = $database->getConnection();
+    }
+    
+    /**
+     * Autenticar usuario
+     */
+    public function login($username, $password, $ip, $userAgent) {
+        try {
+            // Verificar si está bloqueado
+            if ($this->isBlocked($username, $ip)) {
+                $this->logAttempt($username, $ip, $userAgent, false, 'Usuario bloqueado');
+                return [
+                    'success' => false,
+                    'message' => 'Cuenta bloqueada temporalmente. Intenta en 15 minutos.'
+                ];
+            }
+            
+            // Buscar usuario
+            $sql = "SELECT * FROM panel_admins WHERE username = ? AND activo = 1 LIMIT 1";
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([$username]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$user) {
+                $this->logAttempt($username, $ip, $userAgent, false, 'Usuario no existe o inactivo');
+                $this->incrementFailedAttempts($username, $ip);
+                return [
+                    'success' => false,
+                    'message' => 'Usuario o contraseña incorrectos'
+                ];
+            }
+            
+            // Verificar contraseña
+            if (!password_verify($password, $user['password_hash'])) {
+                $this->logAttempt($username, $ip, $userAgent, false, 'Contraseña incorrecta');
+                $this->incrementFailedAttempts($username, $ip);
+                return [
+                    'success' => false,
+                    'message' => 'Usuario o contraseña incorrectos'
+                ];
+            }
+            
+            // Login exitoso
+            $this->resetFailedAttempts($username, $ip);
+            $this->updateLastLogin($user['id']);
+            $this->logAttempt($username, $ip, $userAgent, true, null);
+            
+            return [
+                'success' => true,
+                'user' => $user
+            ];
+            
+        } catch (PDOException $e) {
+            logSecure("Error en login: " . $e->getMessage(), 'ERROR');
+            return [
+                'success' => false,
+                'message' => 'Error del sistema'
             ];
         }
-        
-        $attempts[$ip]['count']++;
-        $attempts[$ip]['last_attempt'] = time();
-        
-        // Bloquear si excede intentos
-        if ($attempts[$ip]['count'] >= $this->maxAttempts) {
-            $attempts[$ip]['locked_until'] = time() + $this->lockoutTime;
-        }
-        
-        $this->saveAttempts($attempts);
     }
     
-    public function isLocked($ip) {
-        $attempts = $this->getAttempts();
+    /**
+     * Verificar si usuario/IP está bloqueado
+     */
+    private function isBlocked($username, $ip) {
+        $sql = "SELECT bloqueado_hasta FROM panel_admins 
+                WHERE username = ? 
+                AND bloqueado_hasta > NOW()";
         
-        if (!isset($attempts[$ip])) {
-            return false;
-        }
+        $stmt = $this->conn->prepare($sql);
+        $stmt->execute([$username]);
         
-        // Verificar si el bloqueo expiró
-        if ($attempts[$ip]['locked_until'] > 0 && time() < $attempts[$ip]['locked_until']) {
-            return true;
-        }
-        
-        // Limpiar si ya pasó el tiempo
-        if ($attempts[$ip]['locked_until'] > 0 && time() >= $attempts[$ip]['locked_until']) {
-            unset($attempts[$ip]);
-            $this->saveAttempts($attempts);
-            return false;
-        }
-        
-        return false;
+        return $stmt->rowCount() > 0;
     }
     
-    public function clearAttempts($ip) {
-        $attempts = $this->getAttempts();
-        unset($attempts[$ip]);
-        $this->saveAttempts($attempts);
+    /**
+     * Incrementar intentos fallidos
+     */
+    private function incrementFailedAttempts($username, $ip) {
+        $sql = "UPDATE panel_admins 
+                SET intentos_fallidos = intentos_fallidos + 1 
+                WHERE username = ?";
+        
+        $stmt = $this->conn->prepare($sql);
+        $stmt->execute([$username]);
+        
+        $sql = "SELECT intentos_fallidos FROM panel_admins WHERE username = ?";
+        $stmt = $this->conn->prepare($sql);
+        $stmt->execute([$username]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($user && $user['intentos_fallidos'] >= $this->maxAttempts) {
+            $bloquear_hasta = date('Y-m-d H:i:s', time() + $this->lockoutTime);
+            
+            $sql = "UPDATE panel_admins 
+                    SET bloqueado_hasta = ? 
+                    WHERE username = ?";
+            
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([$bloquear_hasta, $username]);
+            
+            logSecure("Usuario {$username} bloqueado hasta {$bloquear_hasta}", 'WARN');
+        }
     }
     
-    public function getRemainingLockTime($ip) {
-        $attempts = $this->getAttempts();
+    /**
+     * Resetear intentos fallidos
+     */
+    private function resetFailedAttempts($username, $ip) {
+        $sql = "UPDATE panel_admins 
+                SET intentos_fallidos = 0, 
+                    bloqueado_hasta = NULL 
+                WHERE username = ?";
         
-        if (!isset($attempts[$ip]) || $attempts[$ip]['locked_until'] == 0) {
-            return 0;
-        }
-        
-        $remaining = $attempts[$ip]['locked_until'] - time();
-        return max(0, $remaining);
+        $stmt = $this->conn->prepare($sql);
+        $stmt->execute([$username]);
     }
     
-    private function getAttempts() {
-        if (!file_exists($this->attemptsFile)) {
-            return [];
-        }
+    /**
+     * Actualizar último login
+     */
+    private function updateLastLogin($userId) {
+        $sql = "UPDATE panel_admins 
+                SET ultimo_login = NOW() 
+                WHERE id = ?";
         
-        $content = @file_get_contents($this->attemptsFile);
-        if ($content === false) {
-            return [];
-        }
-        
-        $attempts = json_decode($content, true);
-        return is_array($attempts) ? $attempts : [];
+        $stmt = $this->conn->prepare($sql);
+        $stmt->execute([$userId]);
     }
     
-    private function saveAttempts($attempts) {
-        @file_put_contents($this->attemptsFile, json_encode($attempts), LOCK_EX);
+    /**
+     * Registrar intento de login
+     */
+    private function logAttempt($username, $ip, $userAgent, $exitoso, $motivo) {
+        $sql = "INSERT INTO panel_login_logs 
+                (username, ip_address, user_agent, exitoso, motivo_fallo) 
+                VALUES (?, ?, ?, ?, ?)";
+        
+        $stmt = $this->conn->prepare($sql);
+        $stmt->execute([
+            $username,
+            $ip,
+            $userAgent,
+            $exitoso ? 1 : 0,
+            $motivo
+        ]);
     }
 }
 
-$loginProtection = new LoginProtection();
+// ========================================
+// INICIALIZAR
+// ========================================
+
+try {
+    $db = new Database();
+    $auth = new PanelAuth($db);
+} catch (Exception $e) {
+    die("Error de conexión: " . $e->getMessage());
+}
+
 $userIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+$userAgent = $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
 
 // ========================================
 // VERIFICAR AUTENTICACIÓN
 // ========================================
 
 if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated'] !== true) {
-    // Verificar si está bloqueado
-    if ($loginProtection->isLocked($userIp)) {
-        $remaining = $loginProtection->getRemainingLockTime($userIp);
-        $minutes = ceil($remaining / 60);
+    
+    $login_error = '';
+    
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $username = trim($_POST['username'] ?? '');
+        $password = $_POST['password'] ?? '';
         
-        $login_error = "Demasiados intentos fallidos. Bloqueado por {$minutes} minutos.";
-        logSecure("Intento de acceso bloqueado desde IP: {$userIp}", 'WARN');
-    } 
-    // Procesar intento de login
-    elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
-        $inputPassword = $_POST['password'];
-        
-        // Verificar contraseña con bcrypt
-        if (password_verify($inputPassword, $PANEL_PASSWORD_HASH)) {
-            // Login exitoso
-            $_SESSION['panel_authenticated'] = true;
-            $_SESSION['panel_login_time'] = time();
-            $_SESSION['panel_ip'] = $userIp;
-            
-            // Limpiar intentos fallidos
-            $loginProtection->clearAttempts($userIp);
-            
-            logSecure("Login exitoso al panel desde IP: {$userIp}", 'INFO');
-            
-            // Regenerar ID de sesión por seguridad
-            session_regenerate_id(true);
-            
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+        if (empty($username) || empty($password)) {
+            $login_error = 'Completa todos los campos';
         } else {
-            // Login fallido
-            $loginProtection->recordAttempt($userIp);
-            $login_error = "Contraseña incorrecta";
+            $result = $auth->login($username, $password, $userIp, $userAgent);
             
-            logSecure("Intento de login fallido desde IP: {$userIp}", 'WARN');
-            
-            // Agregar delay para dificultar fuerza bruta
-            sleep(2);
+            if ($result['success']) {
+                $_SESSION['panel_authenticated'] = true;
+                $_SESSION['panel_user_id'] = $result['user']['id'];
+                $_SESSION['panel_username'] = $result['user']['username'];
+                $_SESSION['panel_nombre'] = $result['user']['nombre_completo'];
+                $_SESSION['panel_login_time'] = time();
+                $_SESSION['panel_ip'] = $userIp;
+                
+                session_regenerate_id(true);
+                
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
+            } else {
+                $login_error = $result['message'];
+                sleep(2);
+            }
         }
     }
     
-    // Mostrar formulario de login
+    ob_end_clean();
     ?>
     <!DOCTYPE html>
     <html lang="es">
@@ -184,12 +232,7 @@ if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated']
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Login - Panel de Modelos</title>
         <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            
+            * { margin: 0; padding: 0; box-sizing: border-box; }
             body {
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -199,7 +242,6 @@ if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated']
                 justify-content: center;
                 padding: 20px;
             }
-            
             .login-box {
                 background: white;
                 padding: 40px;
@@ -207,31 +249,35 @@ if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated']
                 box-shadow: 0 20px 60px rgba(0,0,0,0.3);
                 max-width: 400px;
                 width: 100%;
-                text-align: center;
             }
-            
             .login-box h1 {
                 color: #667eea;
                 margin-bottom: 30px;
                 font-size: 28px;
+                text-align: center;
             }
-            
-            .login-box input[type="password"] {
+            .form-group {
+                margin-bottom: 20px;
+            }
+            .form-group label {
+                display: block;
+                margin-bottom: 8px;
+                color: #495057;
+                font-weight: 500;
+            }
+            .form-group input {
                 width: 100%;
-                padding: 15px;
+                padding: 12px 15px;
                 border: 2px solid #e0e0e0;
                 border-radius: 10px;
                 font-size: 16px;
-                margin-bottom: 20px;
                 transition: border 0.3s;
             }
-            
-            .login-box input[type="password"]:focus {
+            .form-group input:focus {
                 outline: none;
                 border-color: #667eea;
             }
-            
-            .login-box button {
+            .btn-login {
                 width: 100%;
                 padding: 15px;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -242,65 +288,72 @@ if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated']
                 cursor: pointer;
                 transition: transform 0.2s;
             }
-            
-            .login-box button:hover {
+            .btn-login:hover {
                 transform: translateY(-2px);
             }
-            
-            .login-box button:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-            }
-            
             .error {
                 background: #f8d7da;
                 color: #721c24;
-                padding: 10px;
-                border-radius: 5px;
+                padding: 12px;
+                border-radius: 8px;
                 margin-bottom: 20px;
                 font-size: 14px;
+                border: 1px solid #f5c6cb;
             }
-            
             .info {
                 background: #d1ecf1;
                 color: #0c5460;
-                padding: 10px;
-                border-radius: 5px;
+                padding: 12px;
+                border-radius: 8px;
                 margin-top: 20px;
                 font-size: 12px;
+                text-align: center;
             }
         </style>
     </head>
     <body>
         <div class="login-box">
-            <h1>🔐 Panel de Modelos TAC</h1>
-            <?php if (isset($login_error)): ?>
-                <div class="error"><?php echo htmlspecialchars($login_error); ?></div>
+            <h1>🔐 Panel de Modelos</h1>
+            
+            <?php if (!empty($login_error)): ?>
+                <div class="error">
+                    ❌ <?php echo htmlspecialchars($login_error); ?>
+                </div>
             <?php endif; ?>
             
-            <?php if ($loginProtection->isLocked($userIp)): ?>
-                <div class="error">
-                    🚫 Acceso temporalmente bloqueado<br>
-                    Espera <?php echo ceil($loginProtection->getRemainingLockTime($userIp) / 60); ?> minutos
-                </div>
-            <?php else: ?>
-                <form method="POST">
+            <form method="POST">
+                <div class="form-group">
+                    <label for="username">Usuario</label>
                     <input 
-                        type="password" 
-                        name="password" 
-                        placeholder="Contraseña" 
+                        type="text" 
+                        id="username"
+                        name="username" 
+                        placeholder="Ingresa tu usuario" 
                         required 
                         autofocus
+                        autocomplete="username"
+                    >
+                </div>
+                
+                <div class="form-group">
+                    <label for="password">Contraseña</label>
+                    <input 
+                        type="password" 
+                        id="password"
+                        name="password" 
+                        placeholder="Ingresa tu contraseña" 
+                        required
                         autocomplete="current-password"
                     >
-                    <button type="submit">Ingresar</button>
-                </form>
-                
-                <div class="info">
-                    🔒 Protegido con encriptación bcrypt<br>
-                    Máximo 5 intentos antes del bloqueo
                 </div>
-            <?php endif; ?>
+                
+                <button type="submit" class="btn-login">Iniciar Sesión</button>
+            </form>
+            
+            <div class="info">
+                🔒 Autenticación segura con base de datos<br>
+                Usuario por defecto: <strong>admin</strong> / <strong>Admin123!</strong>
+            </div>
         </div>
     </body>
     </html>
@@ -312,134 +365,56 @@ if (!isset($_SESSION['panel_authenticated']) || $_SESSION['panel_authenticated']
 // VALIDACIÓN DE SESIÓN ACTIVA
 // ========================================
 
-// Verificar timeout de sesión (30 minutos)
-$sessionTimeout = 1800; // 30 minutos
 if (isset($_SESSION['panel_login_time'])) {
-    if (time() - $_SESSION['panel_login_time'] > $sessionTimeout) {
+    if (time() - $_SESSION['panel_login_time'] > 1800) {
         session_destroy();
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
 }
 
-// Actualizar tiempo de última actividad
 $_SESSION['panel_login_time'] = time();
 
-// Verificar que la IP no haya cambiado (seguridad adicional)
 if (isset($_SESSION['panel_ip']) && $_SESSION['panel_ip'] !== $userIp) {
-    logSecure("Cambio de IP detectado en sesión activa. IP original: {$_SESSION['panel_ip']}, Nueva IP: {$userIp}", 'WARN');
+    logSecure("Cambio de IP detectado", 'WARN');
     session_destroy();
     header('Location: ' . $_SERVER['PHP_SELF']);
     exit;
 }
 
 // ========================================
-// CERRAR SESIÓN
+// LOGOUT
 // ========================================
 
 if (isset($_GET['logout'])) {
-    logSecure("Logout del panel desde IP: {$userIp}", 'INFO');
+    $username = $_SESSION['panel_username'] ?? 'unknown';
+    logSecure("Logout del usuario {$username}", 'INFO');
     session_destroy();
     header('Location: ' . $_SERVER['PHP_SELF']);
     exit;
 }
 
 // ========================================
-// INICIALIZAR BASE DE DATOS
+// INICIALIZAR PANEL
 // ========================================
 
+$nombre_usuario = $_SESSION['panel_nombre'] ?? $_SESSION['panel_username'];
+
 try {
-    $db = new Database();
     $conn = $db->getConnection();
     
-    // Verificar que la tabla existe
     $check_table = $conn->query("SHOW TABLES LIKE 'tac_modelos'");
     if ($check_table->rowCount() === 0) {
-        throw new Exception("La tabla 'tac_modelos' no existe. Por favor ejecuta el script SQL de instalación.");
+        throw new Exception("La tabla 'tac_modelos' no existe.");
     }
     
 } catch (Exception $e) {
-    die("
-    <!DOCTYPE html>
-    <html lang='es'>
-    <head>
-        <meta charset='UTF-8'>
-        <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-        <title>Error - Panel de Modelos</title>
-        <style>
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 20px;
-            }
-            .error-box {
-                background: white;
-                padding: 40px;
-                border-radius: 20px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                max-width: 600px;
-                text-align: center;
-            }
-            .error-icon {
-                font-size: 64px;
-                margin-bottom: 20px;
-            }
-            h1 {
-                color: #dc3545;
-                margin-bottom: 20px;
-            }
-            p {
-                color: #666;
-                line-height: 1.6;
-                margin-bottom: 15px;
-            }
-            .error-detail {
-                background: #f8f9fa;
-                padding: 15px;
-                border-radius: 8px;
-                margin-top: 20px;
-                font-family: monospace;
-                font-size: 14px;
-                color: #dc3545;
-                text-align: left;
-            }
-            a {
-                display: inline-block;
-                margin-top: 20px;
-                padding: 12px 24px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                text-decoration: none;
-                border-radius: 8px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class='error-box'>
-            <div class='error-icon'>❌</div>
-            <h1>Error de Conexión</h1>
-            <p>No se pudo conectar a la base de datos.</p>
-            <div class='error-detail'>" . htmlspecialchars($e->getMessage()) . "</div>
-            <p style='margin-top: 20px;'><strong>Posibles soluciones:</strong></p>
-            <ul style='text-align: left; color: #666; line-height: 2;'>
-                <li>Verifica la configuración en el archivo <code>.env</code></li>
-                <li>Asegúrate de que la base de datos existe</li>
-                <li>Verifica que el usuario tenga permisos</li>
-                <li>Ejecuta el script SQL de instalación</li>
-            </ul>
-            <a href='javascript:location.reload()'>🔄 Reintentar</a>
-        </div>
-    </body>
-    </html>
-    ");
+    ob_end_clean();
+    die("Error: " . $e->getMessage());
 }
 
 // ========================================
-// PROTECCIÓN CSRF
+// CSRF TOKEN
 // ========================================
 
 if (!isset($_SESSION['csrf_token'])) {
@@ -450,7 +425,6 @@ function verifyCsrfToken() {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $token = $_POST['csrf_token'] ?? '';
         if (!hash_equals($_SESSION['csrf_token'], $token)) {
-            logSecure("Intento de CSRF detectado", 'WARN');
             die("Error de seguridad: Token CSRF inválido");
         }
     }
@@ -463,7 +437,6 @@ function verifyCsrfToken() {
 $message = '';
 $message_type = '';
 
-// Verificar CSRF en todas las acciones POST
 verifyCsrfToken();
 
 // CREAR NUEVO MODELO
@@ -475,13 +448,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     
     if (strlen($tac) === 8 && !empty($modelo)) {
         try {
-            // Usar método de DB que ya maneja duplicados
             $resultado = $db->guardarModelo($tac, $modelo, $marca, $fuente);
             
             if ($resultado) {
                 $message = "Modelo agregado/actualizado exitosamente";
                 $message_type = 'success';
-                logSecure("Modelo TAC {$tac} agregado/actualizado por admin desde IP: {$userIp}", 'INFO');
+                logSecure("Modelo TAC {$tac} agregado por {$_SESSION['panel_username']}", 'INFO');
             } else {
                 $message = "Error al guardar el modelo";
                 $message_type = 'error';
@@ -489,7 +461,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         } catch (PDOException $e) {
             $message = "Error al agregar modelo: " . $e->getMessage();
             $message_type = 'error';
-            logSecure("Error al agregar modelo: " . $e->getMessage(), 'ERROR');
         }
     } else {
         $message = "TAC inválido (debe tener 8 dígitos) o modelo vacío";
@@ -511,25 +482,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     WHERE id = ?";
             
             $stmt = $conn->prepare($sql);
-            $result = $stmt->execute([
-                $modelo,
-                $marca,
-                $fuente,
-                $id
-            ]);
+            $result = $stmt->execute([$modelo, $marca, $fuente, $id]);
             
             if ($stmt->rowCount() > 0) {
                 $message = "Modelo actualizado exitosamente";
                 $message_type = 'success';
-                logSecure("Modelo ID {$id} actualizado por admin", 'INFO');
+                logSecure("Modelo ID {$id} actualizado por {$_SESSION['panel_username']}", 'INFO');
             } else {
                 $message = "No se realizaron cambios";
                 $message_type = 'warning';
             }
         } catch (PDOException $e) {
-            $message = "Error al actualizar modelo: " . $e->getMessage();
+            $message = "Error al actualizar: " . $e->getMessage();
             $message_type = 'error';
-            logSecure("Error al actualizar modelo: " . $e->getMessage(), 'ERROR');
         }
     } else {
         $message = "ID inválido o modelo vacío";
@@ -553,30 +518,23 @@ if (isset($_GET['delete'])) {
                 $stmt->execute([$id]);
                 
                 if ($stmt->rowCount() > 0) {
-                    $message = "Modelo eliminado: {$modelo_info['modelo']} (TAC: {$modelo_info['tac']})";
+                    $message = "Modelo eliminado: {$modelo_info['modelo']}";
                     $message_type = 'success';
-                    logSecure("Modelo TAC {$modelo_info['tac']} eliminado por admin", 'INFO');
+                    logSecure("Modelo TAC {$modelo_info['tac']} eliminado por {$_SESSION['panel_username']}", 'INFO');
                 } else {
-                    $message = "No se pudo eliminar el modelo";
+                    $message = "No se pudo eliminar";
                     $message_type = 'error';
                 }
-            } else {
-                $message = "Modelo no encontrado";
-                $message_type = 'error';
             }
         } catch (PDOException $e) {
             $message = "Error al eliminar: " . $e->getMessage();
             $message_type = 'error';
-            logSecure("Error al eliminar modelo #{$id}: " . $e->getMessage(), 'ERROR');
         }
-    } else {
-        $message = "ID inválido";
-        $message_type = 'error';
     }
 }
 
 // ========================================
-// BÚSQUEDA Y FILTROS - CON PROTECCIÓN SQL INJECTION
+// BÚSQUEDA Y PAGINACIÓN
 // ========================================
 
 $search = isset($_GET['search']) ? trim($_GET['search']) : '';
@@ -604,7 +562,7 @@ try {
     
     $where_clause = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
     
-    // Contar total - CON PLACEHOLDERS
+    // Contar total
     $count_sql = "SELECT COUNT(*) as total FROM tac_modelos {$where_clause}";
     $stmt = $conn->prepare($count_sql);
     $stmt->execute($params);
@@ -613,7 +571,7 @@ try {
     $total_records = $result ? (int)$result['total'] : 0;
     $total_pages = $total_records > 0 ? (int)ceil($total_records / $per_page) : 0;
     
-    // Obtener registros - CON PLACEHOLDERS
+    // Obtener registros
     $sql = "SELECT * FROM tac_modelos {$where_clause} 
             ORDER BY veces_usado DESC, ultima_consulta DESC 
             LIMIT ? OFFSET ?";
@@ -625,7 +583,7 @@ try {
     
     $modelos = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Obtener estadísticas
+    // Estadísticas
     $stats_sql = "SELECT 
                     COUNT(*) as total_modelos,
                     COUNT(DISTINCT marca) as total_marcas,
@@ -636,21 +594,19 @@ try {
     $stats_stmt = $conn->query($stats_sql);
     $stats = $stats_stmt->fetch(PDO::FETCH_ASSOC);
     
-    // Asegurar valores numéricos
     $stats['total_modelos'] = (int)$stats['total_modelos'];
     $stats['total_marcas'] = (int)$stats['total_marcas'];
     $stats['total_usos'] = (int)$stats['total_usos'];
     $stats['de_api'] = (int)$stats['de_api'];
     $stats['de_usuarios'] = (int)$stats['de_usuarios'];
     
-    // Obtener fuentes disponibles
+    // Fuentes disponibles
     $fuentes_sql = "SELECT DISTINCT fuente FROM tac_modelos WHERE fuente IS NOT NULL ORDER BY fuente";
     $fuentes_stmt = $conn->query($fuentes_sql);
     $fuentes = $fuentes_stmt->fetchAll(PDO::FETCH_COLUMN);
     
 } catch (PDOException $e) {
-    logSecure("Error en consulta de modelos: " . $e->getMessage(), 'ERROR');
-    
+    logSecure("Error en consulta: " . $e->getMessage(), 'ERROR');
     $modelos = [];
     $total_records = 0;
     $total_pages = 0;
@@ -662,13 +618,9 @@ try {
         'de_usuarios' => 0
     ];
     $fuentes = [];
-    
-    if (!isset($message)) {
-        $message = "Error al cargar los datos: " . $e->getMessage();
-        $message_type = 'error';
-    }
 }
 
+ob_end_flush();
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -710,17 +662,13 @@ try {
             font-size: 28px;
         }
         
-        .header .actions {
-            display: flex;
-            gap: 10px;
+        .header .user-info {
+            text-align: right;
         }
         
-        .session-info {
-            background: rgba(255,255,255,0.2);
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-size: 12px;
-            margin-top: 10px;
+        .header .user-info strong {
+            display: block;
+            margin-bottom: 10px;
         }
         
         .btn {
@@ -984,8 +932,7 @@ try {
         }
         
         .form-group input,
-        .form-group select,
-        .form-group textarea {
+        .form-group select {
             width: 100%;
             padding: 12px;
             border: 2px solid #e0e0e0;
@@ -995,8 +942,7 @@ try {
         }
         
         .form-group input:focus,
-        .form-group select:focus,
-        .form-group textarea:focus {
+        .form-group select:focus {
             outline: none;
             border-color: #667eea;
         }
@@ -1026,31 +972,6 @@ try {
             font-family: 'Courier New', monospace;
             font-size: 13px;
         }
-        
-        @media (max-width: 768px) {
-            .header {
-                flex-direction: column;
-                gap: 15px;
-            }
-            
-            .search-bar {
-                flex-direction: column;
-            }
-            
-            .search-bar input,
-            .search-bar select {
-                width: 100%;
-            }
-            
-            table {
-                font-size: 12px;
-            }
-            
-            table th,
-            table td {
-                padding: 8px;
-            }
-        }
     </style>
 </head>
 <body>
@@ -1059,13 +980,9 @@ try {
             <div>
                 <h1>📱 Panel de Modelos TAC</h1>
                 <p style="opacity: 0.9; margin-top: 5px;">Gestión de base de datos de dispositivos</p>
-                <div class="session-info">
-                    🔒 Sesión segura | IP: <?php echo htmlspecialchars($userIp); ?> | 
-                    Tiempo restante: <span id="sessionTimer">30:00</span>
-                </div>
             </div>
-            <div class="actions">
-                <button class="btn btn-primary" onclick="openModal('create')">➕ Agregar Modelo</button>
+            <div class="user-info">
+                <strong>👤 <?php echo htmlspecialchars($nombre_usuario); ?></strong>
                 <a href="?logout=1" class="btn btn-danger">🚪 Salir</a>
             </div>
         </div>
@@ -1121,6 +1038,7 @@ try {
                 <?php if ($search || $fuente_filter): ?>
                     <a href="?" class="btn btn-secondary">Limpiar</a>
                 <?php endif; ?>
+                <button type="button" class="btn btn-success" onclick="openModal('create')">➕ Agregar Modelo</button>
             </form>
         </div>
         
@@ -1178,7 +1096,7 @@ try {
                                     <a href="?delete=<?php echo $modelo['id']; ?>" 
                                        class="btn btn-sm btn-danger" 
                                        onclick="return confirm('¿Eliminar este modelo?\n\nTAC: <?php echo $modelo['tac']; ?>\nModelo: <?php echo htmlspecialchars($modelo['modelo']); ?>')">
-                                        🗑️ Eliminar
+                                        🗑️
                                     </a>
                                 </td>
                             </tr>
@@ -1286,35 +1204,6 @@ try {
     </div>
     
     <script>
-        // Temporizador de sesión
-        let sessionTimeout = 1800; // 30 minutos en segundos
-        let sessionTimer = setInterval(function() {
-            sessionTimeout--;
-            
-            if (sessionTimeout <= 0) {
-                alert('Tu sesión ha expirado. Serás redirigido al login.');
-                window.location.reload();
-                return;
-            }
-            
-            let minutes = Math.floor(sessionTimeout / 60);
-            let seconds = sessionTimeout % 60;
-            document.getElementById('sessionTimer').textContent = 
-                minutes.toString().padStart(2, '0') + ':' + 
-                seconds.toString().padStart(2, '0');
-            
-            // Advertir cuando queden 5 minutos
-            if (sessionTimeout === 300) {
-                if (confirm('Tu sesión expirará en 5 minutos. ¿Deseas renovarla?')) {
-                    // Hacer una petición silenciosa para renovar
-                    fetch(window.location.href).then(() => {
-                        sessionTimeout = 1800;
-                        alert('Sesión renovada por 30 minutos más');
-                    });
-                }
-            }
-        }, 1000);
-        
         function openModal(action, data = null) {
             const modal = document.getElementById('modalForm');
             const form = document.getElementById('modelForm');
@@ -1326,7 +1215,6 @@ try {
                 title.textContent = 'Agregar Nuevo Modelo';
                 formAction.value = 'create';
                 form.reset();
-                // Restaurar token CSRF
                 form.querySelector('input[name="csrf_token"]').value = '<?php echo $_SESSION['csrf_token']; ?>';
                 formAction.value = 'create';
                 tacInput.readOnly = false;
@@ -1350,33 +1238,14 @@ try {
             document.getElementById('modalForm').classList.remove('active');
         }
         
-        // Cerrar modal al hacer clic fuera
         document.getElementById('modalForm').addEventListener('click', function(e) {
             if (e.target === this) {
                 closeModal();
             }
         });
         
-        // Validar TAC en tiempo real
         document.getElementById('tac').addEventListener('input', function(e) {
             this.value = this.value.replace(/[^0-9]/g, '').substring(0, 8);
-        });
-        
-        // Confirmar antes de salir si hay cambios sin guardar
-        let formChanged = false;
-        document.getElementById('modelForm').addEventListener('change', function() {
-            formChanged = true;
-        });
-        
-        document.getElementById('modelForm').addEventListener('submit', function() {
-            formChanged = false;
-        });
-        
-        window.addEventListener('beforeunload', function(e) {
-            if (formChanged) {
-                e.preventDefault();
-                e.returnValue = '';
-            }
         });
     </script>
 </body>
